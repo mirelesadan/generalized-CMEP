@@ -1,0 +1,43 @@
+# Python and Jupyter
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Raw microscopy inputs and large numerical stores
+*.tif
+*.tiff
+*.zarr/
+*.npy
+*.npz
+*.h5
+*.hdf5
+
+# Generated CMEP products
+/alignment_states/
+/atomic_model_validation_outputs/
+/au_validation_outputs/
+/cpu_viewers/
+/gpu_viewers/
+/localized_atoms/
+/outputs/
+/.runtime_cache/
+
+# Temporary and local-only files
+/tmp*/
+*.tmp
+*.partial
+*.asv
+*.pptx
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

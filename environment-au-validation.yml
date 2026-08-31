@@ -1,0 +1,21 @@
+name: cmep-abtem
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - abtem=1.0.10
+  - ase
+  - cupy
+  - numpy
+  - scipy
+  - matplotlib
+  - plotly
+  - jupyterlab
+  - ipykernel
+  - tifffile
+  - zarr
+  - h5py
+  # OpenBLAS avoids a Windows MKL runtime crash observed in numpy.linalg.
+  - libblas=*=*openblas
+  - libcblas=*=*openblas
+  - liblapack=*=*openblas
