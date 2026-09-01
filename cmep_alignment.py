@@ -274,7 +274,13 @@ def preview_calibration(
     target_distance: float,
     points: Mapping[str, Sequence[Sequence[float]]],
 ) -> dict[str, Any]:
-    """Scale both selected directions, then align cross endpoints to plan."""
+    """Independently scale each selected direction without changing placement.
+
+    Each operation is expressed in current world coordinates and fixes that
+    dataset's first selected point. Calibration therefore changes physical
+    scale along the measured direction but adds no cross-to-plan rotation or
+    translation.
+    """
     clean = validate_alignment_state(state)
     vertical, horizontal, depth_axis = plane_axes(plane)
     depth_value = _finite_scalar(depth, "depth")
@@ -303,58 +309,39 @@ def preview_calibration(
         measurements[dataset] = measurement
         points3d_arrays[dataset] = np.asarray(converted, dtype=np.float64)
 
-    scaled_points = {
+    calibrated_points = {
         dataset: transform_physical_points(
             points3d_arrays[dataset], scale_operations[dataset]
         )
         for dataset in DATASETS
     }
-    axis_vector = np.zeros(3, dtype=np.float64)
-    axis_vector[AXES.index(depth_axis)] = 1.0
-    plan_vector = scaled_points["plan"][1] - scaled_points["plan"][0]
-    cross_vector = scaled_points["cross"][1] - scaled_points["cross"][0]
-    relative_angle = _signed_angle_degrees(
-        cross_vector, plan_vector, axis_vector
-    )
-    rotation = axis_angle_rotation_affine(
-        depth_axis, relative_angle, scaled_points["cross"][0]
-    )
-    rotated_cross = transform_physical_points(scaled_points["cross"], rotation)
-    translation = scaled_points["plan"][0] - rotated_cross[0]
-    endpoint_alignment = translation_affine(translation) @ rotation
-    operations = {
-        "plan": scale_operations["plan"],
-        "cross": endpoint_alignment @ scale_operations["cross"],
-    }
-    aligned_points = {
-        dataset: transform_physical_points(points3d_arrays[dataset], operations[dataset])
+    anchor_residuals = {
+        dataset: float(
+            np.linalg.norm(calibrated_points[dataset][0] - points3d_arrays[dataset][0])
+        )
         for dataset in DATASETS
     }
-    endpoint_residuals = np.linalg.norm(
-        aligned_points["cross"] - aligned_points["plan"], axis=1
-    )
 
     return {
         "plane": validate_plane(plane),
         "depth": depth_value,
         "target_distance": float(target_distance),
         "operations": {
-            dataset: operations[dataset].tolist() for dataset in DATASETS
+            dataset: scale_operations[dataset].tolist() for dataset in DATASETS
         },
         "measurements": measurements,
         "points_3d": {
             dataset: points3d_arrays[dataset].tolist() for dataset in DATASETS
         },
-        "aligned_points_3d": {
-            dataset: aligned_points[dataset].tolist() for dataset in DATASETS
+        "calibrated_points_3d": {
+            dataset: calibrated_points[dataset].tolist() for dataset in DATASETS
         },
-        "relative_alignment": {
-            "reference_dataset": "plan",
-            "moving_dataset": "cross",
-            "rotation_axis": depth_axis,
-            "rotation_degrees": float(relative_angle),
-            "translation_xyz": translation.tolist(),
-            "endpoint_residuals": endpoint_residuals.tolist(),
+        "placement": {
+            "mode": "independent_directional_scale",
+            "anchor": "first_selected_point",
+            "relative_rotation_applied": False,
+            "relative_translation_applied": False,
+            "anchor_residuals": anchor_residuals,
         },
         "base_transforms": deepcopy(clean["transforms"]),
     }
@@ -384,7 +371,7 @@ def apply_calibration_preview(
         "points_3d": deepcopy(preview["points_3d"]),
         "operations": deepcopy(preview["operations"]),
     }
-    for key in ("aligned_points_3d", "relative_alignment"):
+    for key in ("calibrated_points_3d", "placement"):
         if key in preview:
             calibration[key] = deepcopy(preview[key])
     clean["calibrations"].append(calibration)
@@ -491,6 +478,38 @@ def union_depth_range(
         )
         values.extend((float(corners[:, index].min()), float(corners[:, index].max())))
     return min(values), max(values)
+
+
+def suggested_alignment_depth(
+    metadata_by_dataset: Mapping[str, Mapping[str, Any]],
+    state: Mapping[str, Any],
+    plane: str,
+) -> float:
+    """Return a central depth that intersects both transformed datasets.
+
+    If their transformed depth intervals do not overlap, the plan-view
+    dataset's center is used so a new projection still opens on data rather
+    than in the empty gap between datasets.
+    """
+    clean = validate_alignment_state(state)
+    _, _, depth_axis = plane_axes(plane)
+    index = AXES.index(depth_axis)
+    intervals: dict[str, tuple[float, float]] = {}
+    for dataset in DATASETS:
+        corners = transformed_box_corners(
+            metadata_by_dataset[dataset], clean["transforms"][dataset]
+        )
+        intervals[dataset] = (
+            float(corners[:, index].min()),
+            float(corners[:, index].max()),
+        )
+
+    shared_lower = max(interval[0] for interval in intervals.values())
+    shared_upper = min(interval[1] for interval in intervals.values())
+    if shared_lower <= shared_upper:
+        return (shared_lower + shared_upper) / 2.0
+    plan_lower, plan_upper = intervals["plan"]
+    return (plan_lower + plan_upper) / 2.0
 
 
 def slice_transformed_volume(
@@ -729,26 +748,6 @@ def _point3(value: Sequence[float], name: str) -> np.ndarray:
     if point.shape != (3,) or not np.isfinite(point).all():
         raise ValueError(f"{name} must contain exactly three finite coordinates.")
     return point
-
-
-def _signed_angle_degrees(
-    source: Sequence[float], target: Sequence[float], axis: Sequence[float]
-) -> float:
-    """Return the right-handed angle that rotates source onto target."""
-    first = _point3(source, "source direction")
-    second = _point3(target, "target direction")
-    normal = _point3(axis, "rotation axis")
-    first_norm = float(np.linalg.norm(first))
-    second_norm = float(np.linalg.norm(second))
-    normal_norm = float(np.linalg.norm(normal))
-    if min(first_norm, second_norm, normal_norm) <= np.finfo(np.float64).eps:
-        raise ValueError("Angle directions and rotation axis must be nonzero.")
-    first /= first_norm
-    second /= second_norm
-    normal /= normal_norm
-    sine = float(np.dot(normal, np.cross(first, second)))
-    cosine = float(np.clip(np.dot(first, second), -1.0, 1.0))
-    return float(np.rad2deg(np.arctan2(sine, cosine)))
 
 
 def _finite_scalar(value: Any, name: str) -> float:

@@ -21,6 +21,7 @@ from cmep_alignment import (
     rotate_dataset_in_plane,
     save_alignment_state,
     slice_transformed_volume,
+    suggested_alignment_depth,
     transform_physical_points,
     transformed_geometric_center,
     translate_dataset_in_plane,
@@ -735,11 +736,17 @@ class VolumeWorkflowTests(unittest.TestCase):
         np.testing.assert_allclose(operation[:3, :3] @ perpendicular, perpendicular)
         self.assertAlmostEqual(details["scale_factor"], 2.0)
 
-    def test_alignment_preview_translation_and_state_round_trip(self) -> None:
+    def test_alignment_calibration_preserves_manual_placement_and_state_round_trip(
+        self,
+    ) -> None:
         state = create_alignment_state("nm")
+        state["transforms"]["plan"][0][3] = 5.0
+        state["transforms"]["plan"][1][3] = -2.0
+        state["transforms"]["cross"][0][3] = -4.0
+        state["transforms"]["cross"][1][3] = 7.0
         points = {
-            "plan": [[0.0, 0.0], [2.0, 0.0]],
-            "cross": [[1.0, 1.0], [1.0, 3.0]],
+            "plan": [[5.0, -2.0], [7.0, -2.0]],
+            "cross": [[-4.0, 7.0], [-4.0, 10.0]],
         }
         preview = preview_calibration(
             state,
@@ -750,22 +757,27 @@ class VolumeWorkflowTests(unittest.TestCase):
         )
         calibrated = apply_calibration_preview(state, preview)
         self.assertEqual(len(calibrated["calibrations"]), 1)
-        self.assertAlmostEqual(
-            preview["relative_alignment"]["rotation_degrees"], -90.0
-        )
-        plan_endpoints = transform_physical_points(
-            preview["points_3d"]["plan"], calibrated["transforms"]["plan"]
-        )
-        cross_endpoints = transform_physical_points(
-            preview["points_3d"]["cross"], calibrated["transforms"]["cross"]
-        )
-        np.testing.assert_allclose(cross_endpoints, plan_endpoints, atol=1e-12)
-        self.assertAlmostEqual(
-            np.linalg.norm(plan_endpoints[1] - plan_endpoints[0]), 4.0
-        )
-        np.testing.assert_allclose(
-            preview["relative_alignment"]["endpoint_residuals"], [0.0, 0.0], atol=1e-12
-        )
+        self.assertEqual(preview["placement"]["anchor"], "first_selected_point")
+        self.assertFalse(preview["placement"]["relative_rotation_applied"])
+        self.assertFalse(preview["placement"]["relative_translation_applied"])
+        for dataset in ("plan", "cross"):
+            original = np.asarray(preview["points_3d"][dataset])
+            transformed = transform_physical_points(
+                original, preview["operations"][dataset]
+            )
+            np.testing.assert_allclose(transformed[0], original[0], atol=1e-12)
+            self.assertAlmostEqual(np.linalg.norm(transformed[1] - transformed[0]), 4.0)
+            expected = (
+                np.asarray(preview["operations"][dataset])
+                @ np.asarray(state["transforms"][dataset])
+            )
+            np.testing.assert_allclose(
+                calibrated["transforms"][dataset], expected, atol=1e-12
+            )
+
+        plan_anchor = np.asarray(preview["calibrated_points_3d"]["plan"])[0]
+        cross_anchor = np.asarray(preview["calibrated_points_3d"]["cross"])[0]
+        self.assertGreater(np.linalg.norm(plan_anchor - cross_anchor), 1.0)
 
         translated = translate_dataset_in_plane(
             calibrated,
@@ -775,8 +787,16 @@ class VolumeWorkflowTests(unittest.TestCase):
             vertical_delta=-0.75,
             depth=0.5,
         )
-        self.assertAlmostEqual(translated["transforms"]["plan"][0][3], 1.25)
-        self.assertAlmostEqual(translated["transforms"]["plan"][1][3], -0.75)
+        self.assertAlmostEqual(
+            translated["transforms"]["plan"][0][3]
+            - calibrated["transforms"]["plan"][0][3],
+            1.25,
+        )
+        self.assertAlmostEqual(
+            translated["transforms"]["plan"][1][3]
+            - calibrated["transforms"]["plan"][1][3],
+            -0.75,
+        )
 
         with tempfile.TemporaryDirectory(dir=HERE) as directory:
             path = Path(directory) / "state.json"
@@ -856,6 +876,62 @@ class VolumeWorkflowTests(unittest.TestCase):
             {"plan": meta, "cross": meta}, shifted, "yx"
         )
         np.testing.assert_allclose(depth_range, [0.0, 7.0])
+
+    def test_alignment_viewer_auto_depth_uses_shared_transformed_interval(
+        self,
+    ) -> None:
+        volume = np.ones((3, 3, 3), dtype=np.float32)
+        meta = {
+            "length_unit": "nm",
+            "coordinates": {
+                axis: np.arange(3, dtype=np.float64) for axis in "xyz"
+            },
+        }
+        state = create_alignment_state("nm")
+        state["transforms"]["plan"][1][3] = 2.0
+        state["transforms"]["cross"][1][3] = 2.5
+        self.assertAlmostEqual(
+            suggested_alignment_depth(
+                {"plan": meta, "cross": meta}, state, "zx"
+            ),
+            3.25,
+        )
+
+        with tempfile.TemporaryDirectory(dir=HERE) as directory:
+            viewer = AlignmentViewer(
+                {"plan": volume, "cross": volume},
+                {"plan": meta, "cross": meta},
+                state=state,
+                state_path=Path(directory) / "alignment.json",
+                colors={"plan": "red", "cross": "lightblue"},
+                threshold_initial=0.5,
+                threshold_min=0.2,
+                threshold_max=0.8,
+                threshold_count=1,
+                depth_positions=51,
+                minimum_voxel_alpha=0.3,
+                background_color="black",
+                voxel_scale=1.0,
+            )
+            automatic = viewer._slice_payload(
+                {"plane": ["zx"], "threshold_floor": ["0"]}
+            )
+            explicit_zero = viewer._slice_payload(
+                {
+                    "plane": ["zx"],
+                    "depth_value": ["0"],
+                    "threshold_floor": ["0"],
+                }
+            )
+            self.assertAlmostEqual(automatic["depth"], 3.25)
+            self.assertGreater(automatic["datasets"]["plan"]["displayed_point_count"], 0)
+            self.assertGreater(automatic["datasets"]["cross"]["displayed_point_count"], 0)
+            self.assertEqual(
+                explicit_zero["datasets"]["cross"]["displayed_point_count"], 0
+            )
+            html = viewer._html().decode("utf-8")
+            self.assertIn("loadSlice({refit:true})", html)
+            self.assertNotIn("loadSlice({depthValue:0,refit:true})", html)
 
     def test_alignment_viewer_configuration_and_html(self) -> None:
         volume = np.ones((2, 2, 2), dtype=np.float32)
