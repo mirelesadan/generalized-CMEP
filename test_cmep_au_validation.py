@@ -415,6 +415,11 @@ class AuValidationTests(unittest.TestCase):
                 view,
                 config,
                 Path(temp_dir) / "tiny_reconstruction.npz",
+                object_step_size=0.25,
+                probe_step_size=0.05,
+                step_size_damping_rate=0.99,
+                probe_correction_start_iteration=1,
+                position_correction=False,
                 verbose=False,
             )
             self.assertEqual(reconstruction.phase_stack_slice_row_col.ndim, 3)
@@ -422,6 +427,16 @@ class AuValidationTests(unittest.TestCase):
             self.assertTrue(np.isfinite(reconstruction.error))
             self.assertTrue(
                 reconstruction.metadata["abtem_fresnel_compatibility_shim_applied"]
+            )
+            controls = reconstruction.metadata["reconstruction_controls"]
+            self.assertEqual(controls["object_step_size"], 0.25)
+            self.assertEqual(controls["probe_step_size"], 0.05)
+            self.assertEqual(controls["step_size_damping_rate"], 0.99)
+            self.assertEqual(controls["probe_correction_start_iteration"], 1)
+            self.assertFalse(controls["position_correction"])
+            self.assertEqual(
+                controls["abtem_pre_probe_correction_update_steps"],
+                controls["scan_position_count"],
             )
 
     def test_tiny_instrument_condition_applies_physical_effects(self) -> None:

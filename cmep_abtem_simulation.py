@@ -1085,6 +1085,11 @@ def reconstruct_multislice_ptychography(
     config: PtychographyConfig,
     output_path: str | Path,
     *,
+    object_step_size: float = 1.0,
+    probe_step_size: float = 1.0,
+    step_size_damping_rate: float = 0.995,
+    probe_correction_start_iteration: int | None = 0,
+    position_correction: bool = False,
     overwrite: bool = False,
     verbose: bool = True,
 ) -> ReconstructionResult:
@@ -1092,8 +1097,47 @@ def reconstruct_multislice_ptychography(
 
     abTEM's current operator is in-memory. Loading a large 8 nm 4D dataset may
     therefore require substantially more RAM/VRAM than its compressed Zarr size.
+    Step sizes and damping are forwarded to abTEM's iterative operator. Probe
+    correction can start after a whole number of scan iterations; ``None``
+    disables it. Position correction is disabled by default for exact simulated
+    scan coordinates.
     """
     cfg = config.validated()
+    object_step = _positive_finite(object_step_size, "object_step_size")
+    probe_step = _positive_finite(probe_step_size, "probe_step_size")
+    damping_rate = _positive_finite(
+        step_size_damping_rate, "step_size_damping_rate"
+    )
+    if damping_rate > 1.0:
+        raise ValueError("step_size_damping_rate must be less than or equal to 1.")
+    if probe_correction_start_iteration is not None:
+        if isinstance(probe_correction_start_iteration, (bool, np.bool_)):
+            raise TypeError(
+                "probe_correction_start_iteration must be an integer or None."
+            )
+        if int(probe_correction_start_iteration) != probe_correction_start_iteration:
+            raise ValueError(
+                "probe_correction_start_iteration must be an integer or None."
+            )
+        if probe_correction_start_iteration < 0:
+            raise ValueError(
+                "probe_correction_start_iteration must be non-negative or None."
+            )
+        probe_start_iteration: int | None = int(
+            probe_correction_start_iteration
+        )
+    else:
+        probe_start_iteration = None
+    if not isinstance(position_correction, (bool, np.bool_)):
+        raise TypeError("position_correction must be Boolean.")
+
+    reconstruction_controls = {
+        "object_step_size": object_step,
+        "probe_step_size": probe_step,
+        "step_size_damping_rate": damping_rate,
+        "probe_correction_start_iteration": probe_start_iteration,
+        "position_correction": bool(position_correction),
+    }
     sim = load_4dstem(simulation) if isinstance(simulation, (str, Path)) else simulation
     path = _require_suffix(output_path, ".npz")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1104,6 +1148,7 @@ def reconstruct_multislice_ptychography(
             "simulation_fingerprint": sim.metadata["fingerprint_sha256"],
             "view": view.metadata,
             "configuration": cfg.to_dict(),
+            "reconstruction_controls": reconstruction_controls,
         }
     )
     if _cache_matches(
@@ -1116,6 +1161,19 @@ def reconstruct_multislice_ptychography(
         return load_reconstruction(path)
 
     patterns = sim.diffraction_patterns.compute(progress_bar=verbose)
+    scan_position_count = int(np.prod(patterns.shape[:-2], dtype=np.int64))
+    total_update_steps = int(cfg.reconstruction_iterations * scan_position_count)
+    if probe_start_iteration is None:
+        pre_probe_correction_update_steps = total_update_steps + 1
+    elif probe_start_iteration == 0:
+        pre_probe_correction_update_steps = None
+    else:
+        pre_probe_correction_update_steps = int(
+            probe_start_iteration * scan_position_count
+        )
+    pre_position_correction_update_steps = (
+        0 if bool(position_correction) else None
+    )
     cell_z = float(view.atoms.cell.lengths()[2])
     num_slices = max(
         1, int(round(cell_z / cfg.reconstruction_slice_thickness_angstrom))
@@ -1138,6 +1196,17 @@ def reconstruct_multislice_ptychography(
         max_iterations=cfg.reconstruction_iterations,
         random_seed=cfg.random_seed,
         verbose=verbose,
+        parameters={
+            "object_step_size": object_step,
+            "probe_step_size": probe_step,
+            "step_size_damping_rate": damping_rate,
+            "pre_probe_correction_update_steps": (
+                pre_probe_correction_update_steps
+            ),
+            "pre_position_correction_update_steps": (
+                pre_position_correction_update_steps
+            ),
+        },
     )
     object_array = np.asarray(objects.array, dtype=np.complex64)
     probe_array = np.asarray(probes.array, dtype=np.complex64)
@@ -1158,6 +1227,17 @@ def reconstruct_multislice_ptychography(
         "simulation_fingerprint_sha256": sim.metadata["fingerprint_sha256"],
         "view": view.metadata,
         "configuration": cfg.to_dict(),
+        "reconstruction_controls": {
+            **reconstruction_controls,
+            "scan_position_count": scan_position_count,
+            "total_update_steps": total_update_steps,
+            "abtem_pre_probe_correction_update_steps": (
+                pre_probe_correction_update_steps
+            ),
+            "abtem_pre_position_correction_update_steps": (
+                pre_position_correction_update_steps
+            ),
+        },
         "objects_shape_slice_xy": list(object_array.shape),
         "phase_export_shape_slice_row_col": list(phase_stack.shape),
         "phase_export_axis_order": ["slice_z_view", "row_y_view", "col_x_view"],
