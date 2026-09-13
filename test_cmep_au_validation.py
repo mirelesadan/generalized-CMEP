@@ -16,11 +16,15 @@ from cmep_abtem_simulation import (
     _derived_seeds,
     _thermal_sigmas_for_atoms,
     _validate_zarr_output_path,
+    analyze_oracle_depth_identifiability,
     analyze_4dstem_quality,
     estimate_simulation_resources,
     export_oracle_potential,
     load_4dstem,
+    load_complex_object_initialization,
+    load_reconstruction_history,
     make_validation_conditions,
+    oracle_potential_to_complex_object,
     plot_4dstem_quality,
     reconstruct_multislice_ptychography,
     simulate_4dstem,
@@ -382,6 +386,56 @@ class AuValidationTests(unittest.TestCase):
                     len(oracle.x_angstrom),
                 ),
             )
+            target_slice_count = max(
+                1,
+                int(
+                    round(
+                        float(view.atoms.cell.lengths()[2])
+                        / config.reconstruction_slice_thickness_angstrom
+                    )
+                ),
+            )
+            complex_initializer = oracle_potential_to_complex_object(
+                oracle,
+                Path(temp_dir) / "oracle_complex_initializer.npz",
+                energy_ev=config.energy_ev,
+                target_slice_count=target_slice_count,
+            )
+            self.assertEqual(
+                complex_initializer.objects_complex_slice_xy.shape[0],
+                target_slice_count,
+            )
+            self.assertTrue(
+                np.allclose(
+                    np.abs(complex_initializer.objects_complex_slice_xy),
+                    1.0,
+                    atol=2e-6,
+                )
+            )
+            from abtem.core.energy import energy2sigma
+
+            expected_projected_transmission = np.exp(
+                1j
+                * energy2sigma(config.energy_ev)
+                * np.sum(oracle.stack_slice_row_col, axis=0, dtype=np.float64)
+            ).T
+            np.testing.assert_allclose(
+                np.prod(
+                    complex_initializer.objects_complex_slice_xy.astype(
+                        np.complex128
+                    ),
+                    axis=0,
+                ),
+                expected_projected_transmission,
+                atol=2e-6,
+            )
+            loaded_initializer = load_complex_object_initialization(
+                complex_initializer.output_path
+            )
+            self.assertEqual(
+                loaded_initializer.metadata["simulation_only_truth_initialization"],
+                True,
+            )
             simulation = simulate_4dstem(
                 view,
                 config,
@@ -496,6 +550,42 @@ class AuValidationTests(unittest.TestCase):
             self.assertEqual(
                 len(object_metadata["initial_complex_array_sha256"]), 64
             )
+            oracle_initialized = reconstruct_multislice_ptychography(
+                loaded,
+                view,
+                config,
+                Path(temp_dir) / "tiny_oracle_initialized_reconstruction.npz",
+                probe_initialization="simulation_exact",
+                object_initialization="provided_complex",
+                object_initialization_source=loaded_initializer,
+                object_step_size=0.25,
+                probe_step_size=0.05,
+                step_size_damping_rate=0.99,
+                probe_correction_start_iteration=None,
+                position_correction=False,
+                capture_iterations=(0, 1),
+                verbose=False,
+            )
+            history = load_reconstruction_history(
+                oracle_initialized.metadata["iteration_history"]["output_path"]
+            )
+            np.testing.assert_array_equal(history.iterations, [0, 1])
+            self.assertEqual(
+                history.objects_complex_iteration_slice_xy.shape[1],
+                target_slice_count,
+            )
+            self.assertEqual(
+                history.metadata["object_initialization"]["mode"],
+                "provided_complex",
+            )
+            diagnostic = analyze_oracle_depth_identifiability(
+                history,
+                Path(temp_dir) / "tiny_depth_identifiability.npz",
+            )
+            self.assertAlmostEqual(diagnostic.oracle_correlations[0], 1.0, places=7)
+            self.assertLess(diagnostic.scale_adjusted_nrmse[0], 1e-12)
+            self.assertLess(diagnostic.transmission_departure[0], 1e-12)
+            self.assertTrue(diagnostic.output_path.is_file())
             with self.assertRaisesRegex(ValueError, "probe_initialization"):
                 reconstruct_multislice_ptychography(
                     loaded,

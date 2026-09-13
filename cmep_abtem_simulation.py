@@ -27,9 +27,12 @@ SIMULATION_SCHEMA = "cmep.abtem-4dstem.v3"
 ORACLE_SCHEMA = "cmep.abtem-oracle-potential.v2"
 RECONSTRUCTION_SCHEMA = "cmep.abtem-multislice-reconstruction.v3"
 QC_SCHEMA = "cmep.abtem-4dstem-qc.v2"
+COMPLEX_OBJECT_INITIALIZATION_SCHEMA = "cmep.abtem-complex-object-initialization.v1"
+RECONSTRUCTION_HISTORY_SCHEMA = "cmep.abtem-reconstruction-history.v1"
+DEPTH_IDENTIFIABILITY_SCHEMA = "cmep.abtem-depth-identifiability.v1"
 
 _PROBE_INITIALIZATION_MODES = {"abtem_default", "simulation_exact"}
-_OBJECT_INITIALIZATION_MODES = {"uniform", "split_projection"}
+_OBJECT_INITIALIZATION_MODES = {"uniform", "split_projection", "provided_complex"}
 
 _WINDOWS_LEGACY_PATH_LIMIT = 260
 # Zarr 3 appends nested array/chunk keys and a 32-character atomic-write token.
@@ -329,6 +332,53 @@ class ReconstructionResult:
     manifest_path: Path
 
 
+@dataclass(frozen=True)
+class ComplexObjectInitializationResult:
+    """Complex transmission slices on a physically described source grid."""
+
+    objects_complex_slice_xy: np.ndarray
+    x_angstrom: np.ndarray
+    y_angstrom: np.ndarray
+    z_edges_angstrom: np.ndarray
+    metadata: dict[str, Any]
+    output_path: Path
+    manifest_path: Path
+
+
+@dataclass(frozen=True)
+class ReconstructionHistoryResult:
+    """Selected object states captured from one reconstruction run."""
+
+    iterations: np.ndarray
+    errors: np.ndarray
+    objects_complex_iteration_slice_xy: np.ndarray
+    x_angstrom: np.ndarray
+    y_angstrom: np.ndarray
+    z_angstrom: np.ndarray
+    metadata: dict[str, Any]
+    output_path: Path
+    manifest_path: Path
+
+
+@dataclass(frozen=True)
+class DepthIdentifiabilityResult:
+    """Oracle-referenced metrics for depth migration during reconstruction."""
+
+    iterations: np.ndarray
+    errors: np.ndarray
+    phase_fractions: np.ndarray
+    near_wrap_counts: np.ndarray
+    oracle_correlations: np.ndarray
+    reversed_oracle_correlations: np.ndarray
+    per_slice_oracle_correlations: np.ndarray
+    global_phase_scales: np.ndarray
+    scale_adjusted_nrmse: np.ndarray
+    transmission_departure: np.ndarray
+    metadata: dict[str, Any]
+    output_path: Path
+    manifest_path: Path
+
+
 def environment_report() -> dict[str, Any]:
     """Report the runtime and whether CuPy can see a CUDA device."""
     report: dict[str, Any] = {
@@ -594,6 +644,185 @@ def load_oracle_potential(path: str | Path) -> OraclePotentialResult:
         x_angstrom=x,
         y_angstrom=y,
         z_angstrom=z,
+        metadata=metadata,
+        output_path=source.resolve(),
+        manifest_path=manifest.resolve(),
+    )
+
+
+def oracle_potential_to_complex_object(
+    oracle: OraclePotentialResult | str | Path,
+    output_path: str | Path,
+    *,
+    energy_ev: float,
+    target_slice_count: int,
+    overwrite: bool = False,
+) -> ComplexObjectInitializationResult:
+    """Convert oracle potential into thin-phase transmission slabs.
+
+    The abTEM potential values are already projected through each native slice,
+    so depth rebinning conserves projected potential before applying
+    ``exp(1j * sigma * V_projected)``. No extra thickness factor is applied.
+    The returned in-plane grid remains the oracle grid; reconstruction performs
+    coordinate-aware interpolation after its padded object grid is known.
+    """
+    source = load_oracle_potential(oracle) if isinstance(oracle, (str, Path)) else oracle
+    if not isinstance(source, OraclePotentialResult):
+        raise TypeError("oracle must be an OraclePotentialResult or oracle .npz path.")
+    energy = _positive_finite(energy_ev, "energy_ev")
+    if isinstance(target_slice_count, (bool, np.bool_)):
+        raise TypeError("target_slice_count must be a positive integer.")
+    if int(target_slice_count) != target_slice_count or target_slice_count < 1:
+        raise ValueError("target_slice_count must be a positive integer.")
+    num_target_slices = int(target_slice_count)
+
+    stack = np.asarray(source.stack_slice_row_col, dtype=np.float64)
+    x = _strict_coordinate_vector(source.x_angstrom, "oracle x_angstrom")
+    y = _strict_coordinate_vector(source.y_angstrom, "oracle y_angstrom")
+    z = np.asarray(source.z_angstrom, dtype=np.float64)
+    if stack.ndim != 3 or stack.shape != (len(z), len(y), len(x)):
+        raise ValueError(
+            "Oracle potential shape must be (slice,row=y,col=x) and match its "
+            f"coordinates; received {stack.shape}."
+        )
+    if not np.isfinite(stack).all():
+        raise ValueError("Oracle potential contains non-finite values.")
+
+    thicknesses = np.asarray(
+        source.metadata.get("slice_thicknesses_angstrom"), dtype=np.float64
+    )
+    if thicknesses.shape != (stack.shape[0],) or not np.isfinite(thicknesses).all():
+        raise ValueError(
+            "Oracle metadata must contain one finite slice thickness per slice."
+        )
+    if np.any(thicknesses <= 0.0):
+        raise ValueError("Oracle slice thicknesses must be positive.")
+    source_edges = np.concatenate(([0.0], np.cumsum(thicknesses)))
+    expected_centers = (source_edges[:-1] + source_edges[1:]) / 2.0
+    if z.shape != expected_centers.shape or not np.allclose(
+        z, expected_centers, rtol=0.0, atol=1e-7
+    ):
+        raise ValueError(
+            "Oracle z coordinates are inconsistent with its slice thicknesses."
+        )
+
+    target_edges = np.linspace(
+        0.0, float(source_edges[-1]), num_target_slices + 1, dtype=np.float64
+    )
+    overlap = np.maximum(
+        0.0,
+        np.minimum(target_edges[1:, None], source_edges[None, 1:])
+        - np.maximum(target_edges[:-1, None], source_edges[None, :-1]),
+    )
+    weights = overlap / thicknesses[None, :]
+    if not np.allclose(weights.sum(axis=0), 1.0, rtol=0.0, atol=1e-10):
+        raise RuntimeError("Depth rebinning did not conserve every oracle slice.")
+    target_potential = np.tensordot(weights, stack, axes=(1, 0))
+
+    from abtem.core.energy import energy2sigma
+
+    sigma = float(energy2sigma(energy))
+    transmission_slice_row_col = np.exp(1j * sigma * target_potential)
+    objects = np.transpose(transmission_slice_row_col, (0, 2, 1)).astype(
+        np.complex64
+    )
+    target_centers = (target_edges[:-1] + target_edges[1:]) / 2.0
+    path = _require_suffix(output_path, ".npz")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path = path.with_suffix(".json")
+    conversion = {
+        "schema": COMPLEX_OBJECT_INITIALIZATION_SCHEMA,
+        "source_oracle_fingerprint_sha256": source.metadata.get(
+            "fingerprint_sha256"
+        ),
+        "model_fingerprint_sha256": source.metadata.get(
+            "model_fingerprint_sha256"
+        ),
+        "view": source.metadata.get("view"),
+        "source_oracle_configuration": source.metadata.get("configuration"),
+        "energy_ev": energy,
+        "interaction_parameter_sigma": sigma,
+        "target_slice_count": num_target_slices,
+        "target_z_edges_angstrom": target_edges.tolist(),
+        "conversion_rule": (
+            "Conserve projected potential by physical slab overlap, then apply "
+            "exp(1j * sigma * V_projected); no additional thickness factor."
+        ),
+    }
+    fingerprint = _fingerprint(conversion)
+    if _cache_matches(
+        path,
+        manifest_path,
+        fingerprint,
+        overwrite=overwrite,
+        schema=COMPLEX_OBJECT_INITIALIZATION_SCHEMA,
+    ):
+        return load_complex_object_initialization(path)
+
+    metadata = {
+        **conversion,
+        "fingerprint_sha256": fingerprint,
+        "source_oracle_path": str(source.output_path.resolve()),
+        "source_oracle_shape_slice_row_col": list(stack.shape),
+        "source_oracle_slice_thicknesses_angstrom": thicknesses.tolist(),
+        "source_oracle_z_edges_angstrom": source_edges.tolist(),
+        "objects_shape_slice_xy": list(objects.shape),
+        "axis_order": ["slice_z_view", "x_view", "y_view"],
+        "coordinate_unit": "angstrom",
+        "x_range_angstrom": _range(x),
+        "y_range_angstrom": _range(y),
+        "z_center_range_angstrom": _range(target_centers),
+        "complex_array_dtype": str(objects.dtype),
+        "complex_array_sha256": _sha256_array(objects),
+        "simulation_only_truth_initialization": True,
+        "software_versions": _software_versions(),
+    }
+    np.savez_compressed(
+        path,
+        objects_complex_slice_xy=objects,
+        x_angstrom=x,
+        y_angstrom=y,
+        z_edges_angstrom=target_edges,
+    )
+    _write_json(manifest_path, metadata)
+    return ComplexObjectInitializationResult(
+        objects_complex_slice_xy=objects,
+        x_angstrom=x,
+        y_angstrom=y,
+        z_edges_angstrom=target_edges,
+        metadata=metadata,
+        output_path=path.resolve(),
+        manifest_path=manifest_path.resolve(),
+    )
+
+
+def load_complex_object_initialization(
+    path: str | Path,
+) -> ComplexObjectInitializationResult:
+    """Load a physically described complex-object initializer."""
+    source = _require_suffix(path, ".npz")
+    manifest = source.with_suffix(".json")
+    if not source.is_file() or not manifest.is_file():
+        raise FileNotFoundError(
+            f"Complex-object initialization cache is incomplete: {source}"
+        )
+    metadata = json.loads(manifest.read_text(encoding="utf-8"))
+    if metadata.get("schema") != COMPLEX_OBJECT_INITIALIZATION_SCHEMA:
+        raise ValueError(
+            "Complex-object initialization manifest has an unsupported schema."
+        )
+    with np.load(source, allow_pickle=False) as data:
+        objects = np.asarray(data["objects_complex_slice_xy"], dtype=np.complex64)
+        x = np.asarray(data["x_angstrom"], dtype=np.float64)
+        y = np.asarray(data["y_angstrom"], dtype=np.float64)
+        z_edges = np.asarray(data["z_edges_angstrom"], dtype=np.float64)
+    if _sha256_array(objects) != metadata.get("complex_array_sha256"):
+        raise ValueError("Complex-object initialization array hash does not match.")
+    return ComplexObjectInitializationResult(
+        objects_complex_slice_xy=objects,
+        x_angstrom=x,
+        y_angstrom=y,
+        z_edges_angstrom=z_edges,
         metadata=metadata,
         output_path=source.resolve(),
         manifest_path=manifest.resolve(),
@@ -1090,12 +1319,15 @@ def reconstruct_multislice_ptychography(
     *,
     probe_initialization: str = "abtem_default",
     object_initialization: str = "uniform",
-    object_initialization_source: ReconstructionResult | str | Path | None = None,
+    object_initialization_source: (
+        ReconstructionResult | ComplexObjectInitializationResult | str | Path | None
+    ) = None,
     object_step_size: float = 1.0,
     probe_step_size: float = 1.0,
     step_size_damping_rate: float = 0.995,
     probe_correction_start_iteration: int | None = 0,
     position_correction: bool = False,
+    capture_iterations: tuple[int, ...] | list[int] | None = None,
     overwrite: bool = False,
     verbose: bool = True,
 ) -> ReconstructionResult:
@@ -1107,11 +1339,15 @@ def reconstruct_multislice_ptychography(
     probe encoded by the simulation manifest on the reconstruction grid before
     the first PIE update. ``object_initialization='split_projection'`` requires
     a compatible one-slice reconstruction and distributes its complex
-    transmission evenly across the requested target slices. Step sizes and
-    damping are forwarded to abTEM's iterative operator. Probe correction can
-    start after a whole number of scan iterations; ``None`` disables it.
-    Position correction is disabled by default for exact simulated scan
-    coordinates.
+    transmission evenly across the requested target slices.
+    ``object_initialization='provided_complex'`` accepts physically described
+    complex slices and linearly resamples only their in-plane coordinates onto
+    the reconstruction grid. ``capture_iterations`` stores selected states from
+    one run; iteration 0 is the initialized object before any PIE update. Step
+    sizes and damping are forwarded to abTEM's iterative operator. Probe
+    correction can start after a whole number of scan iterations; ``None``
+    disables it. Position correction is disabled by default for exact simulated
+    scan coordinates.
     """
     cfg = config.validated()
     sim = (
@@ -1135,6 +1371,7 @@ def reconstruct_multislice_ptychography(
     object_mode = _normalize_object_initialization(object_initialization)
     object_source, object_descriptor = _reconstruction_object_descriptor(
         sim,
+        cfg,
         object_mode,
         object_initialization_source,
     )
@@ -1166,6 +1403,9 @@ def reconstruct_multislice_ptychography(
         probe_start_iteration = None
     if not isinstance(position_correction, (bool, np.bool_)):
         raise TypeError("position_correction must be Boolean.")
+    checkpoint_iterations = _normalize_capture_iterations(
+        capture_iterations, cfg.reconstruction_iterations
+    )
 
     base_reconstruction_controls = {
         "probe_initialization": probe_mode,
@@ -1181,6 +1421,10 @@ def reconstruct_multislice_ptychography(
         "object_initialization": object_mode,
         "object_descriptor_fingerprint_sha256": object_descriptor_fingerprint,
     }
+    if checkpoint_iterations:
+        reconstruction_controls["capture_iterations"] = list(
+            checkpoint_iterations
+        )
     # Preserve cache compatibility for the historical deterministic initializer.
     fingerprint_controls = (
         base_reconstruction_controls
@@ -1206,7 +1450,10 @@ def reconstruct_multislice_ptychography(
         overwrite=overwrite,
         schema=RECONSTRUCTION_SCHEMA,
     ):
-        return load_reconstruction(path)
+        cached = load_reconstruction(path)
+        if checkpoint_iterations:
+            load_reconstruction_history(_reconstruction_history_path(path))
+        return cached
 
     patterns = sim.diffraction_patterns.compute(progress_bar=verbose)
     scan_position_count = int(np.prod(patterns.shape[:-2], dtype=np.int64))
@@ -1250,10 +1497,21 @@ def reconstruct_multislice_ptychography(
         sim,
         object_descriptor,
         object_source,
+        target_z_edges_angstrom=np.linspace(
+            0.0, cell_z, num_slices + 1, dtype=np.float64
+        ),
         descriptor_fingerprint=object_descriptor_fingerprint,
     )
-    objects, probes, positions, error = operator.reconstruct(
+    initial_object_array: np.ndarray | None = None
+    if checkpoint_iterations:
+        from abtem.core.backend import asnumpy
+
+        initial_object_array = np.asarray(
+            asnumpy(operator._objects), dtype=np.complex64
+        ).copy()
+    reconstruction_output = operator.reconstruct(
         max_iterations=cfg.reconstruction_iterations,
+        return_iterations=bool(checkpoint_iterations),
         random_seed=cfg.random_seed,
         verbose=verbose,
         parameters={
@@ -1268,6 +1526,16 @@ def reconstruct_multislice_ptychography(
             ),
         },
     )
+    if checkpoint_iterations:
+        object_iterations, probe_iterations, position_iterations, error_iterations = (
+            reconstruction_output
+        )
+        objects = object_iterations[-1]
+        probes = probe_iterations[-1]
+        positions = position_iterations[-1]
+        error = error_iterations[-1]
+    else:
+        objects, probes, positions, error = reconstruction_output
     object_array = np.asarray(objects.array, dtype=np.complex64)
     probe_array = np.asarray(probes.array, dtype=np.complex64)
     positions_array = np.asarray(positions, dtype=np.float64)
@@ -1281,6 +1549,67 @@ def reconstruct_multislice_ptychography(
     x = object_origin_xy[0] + np.arange(object_array.shape[1]) * sampling[0]
     y = object_origin_xy[1] + np.arange(object_array.shape[2]) * sampling[1]
     z = (np.arange(num_slices, dtype=np.float64) + 0.5) * slice_thickness
+    history_metadata: dict[str, Any] | None = None
+    if checkpoint_iterations:
+        if initial_object_array is None:
+            raise RuntimeError("The requested iteration-0 object was not captured.")
+        selected_objects = []
+        selected_errors = []
+        for iteration in checkpoint_iterations:
+            if iteration == 0:
+                selected_objects.append(initial_object_array)
+                selected_errors.append(np.nan)
+            else:
+                selected_objects.append(
+                    np.asarray(
+                        object_iterations[iteration - 1].array,
+                        dtype=np.complex64,
+                    )
+                )
+                selected_errors.append(float(error_iterations[iteration - 1]))
+        history_path = _reconstruction_history_path(path)
+        history_manifest_path = history_path.with_suffix(".json")
+        history_arrays = np.stack(selected_objects, axis=0).astype(np.complex64)
+        history_fingerprint = _fingerprint(
+            {
+                "schema": RECONSTRUCTION_HISTORY_SCHEMA,
+                "reconstruction_fingerprint_sha256": fingerprint,
+                "iterations": list(checkpoint_iterations),
+                "objects_sha256": _sha256_array(history_arrays),
+            }
+        )
+        history_metadata = {
+            "schema": RECONSTRUCTION_HISTORY_SCHEMA,
+            "fingerprint_sha256": history_fingerprint,
+            "reconstruction_fingerprint_sha256": fingerprint,
+            "simulation_fingerprint_sha256": sim.metadata["fingerprint_sha256"],
+            "view": view.metadata,
+            "configuration": cfg.to_dict(),
+            "object_initialization": object_initialization_metadata,
+            "iterations": list(checkpoint_iterations),
+            "iteration_zero_definition": (
+                "Initialized object after coordinate resampling and before any PIE update."
+            ),
+            "error_at_iteration_zero": None,
+            "objects_shape_iteration_slice_xy": list(history_arrays.shape),
+            "object_sampling_xy_angstrom": list(sampling),
+            "object_origin_xy_angstrom": object_origin_xy.tolist(),
+            "slice_thickness_angstrom": slice_thickness,
+            "coordinate_unit": "angstrom",
+            "complex_array_dtype": str(history_arrays.dtype),
+            "complex_array_sha256": _sha256_array(history_arrays),
+            "software_versions": _software_versions(),
+        }
+        np.savez_compressed(
+            history_path,
+            iterations=np.asarray(checkpoint_iterations, dtype=np.int64),
+            errors=np.asarray(selected_errors, dtype=np.float64),
+            objects_complex_iteration_slice_xy=history_arrays,
+            x_angstrom=x,
+            y_angstrom=y,
+            z_angstrom=z,
+        )
+        _write_json(history_manifest_path, history_metadata)
     metadata = {
         "schema": RECONSTRUCTION_SCHEMA,
         "fingerprint_sha256": fingerprint,
@@ -1312,6 +1641,18 @@ def reconstruct_multislice_ptychography(
         "coordinate_ranges_angstrom": {"x": _range(x), "y": _range(y), "z": _range(z)},
         "reconstruction_error": float(error),
         "abtem_fresnel_compatibility_shim_applied": compatibility_shim_applied,
+        "iteration_history": (
+            None
+            if history_metadata is None
+            else {
+                "output_path": str(_reconstruction_history_path(path).resolve()),
+                "manifest_path": str(
+                    _reconstruction_history_path(path).with_suffix(".json").resolve()
+                ),
+                "fingerprint_sha256": history_metadata["fingerprint_sha256"],
+                "iterations": history_metadata["iterations"],
+            }
+        ),
         "software_versions": _software_versions(),
     }
     np.savez_compressed(
@@ -1359,6 +1700,413 @@ def load_reconstruction(path: str | Path) -> ReconstructionResult:
         output_path=source.resolve(),
         manifest_path=manifest.resolve(),
     )
+
+
+def load_reconstruction_history(path: str | Path) -> ReconstructionHistoryResult:
+    """Load selected iteration states captured during one reconstruction."""
+    source = _require_suffix(path, ".npz")
+    manifest = source.with_suffix(".json")
+    if not source.is_file() or not manifest.is_file():
+        raise FileNotFoundError(f"Reconstruction history cache is incomplete: {source}")
+    metadata = json.loads(manifest.read_text(encoding="utf-8"))
+    if metadata.get("schema") != RECONSTRUCTION_HISTORY_SCHEMA:
+        raise ValueError("Reconstruction history manifest has an unsupported schema.")
+    with np.load(source, allow_pickle=False) as data:
+        iterations = np.asarray(data["iterations"], dtype=np.int64)
+        errors = np.asarray(data["errors"], dtype=np.float64)
+        objects = np.asarray(
+            data["objects_complex_iteration_slice_xy"], dtype=np.complex64
+        )
+        x = np.asarray(data["x_angstrom"], dtype=np.float64)
+        y = np.asarray(data["y_angstrom"], dtype=np.float64)
+        z = np.asarray(data["z_angstrom"], dtype=np.float64)
+    if objects.ndim != 4 or objects.shape[0] != len(iterations):
+        raise ValueError(
+            "Reconstruction history objects must have shape "
+            "(iteration,slice,x,y)."
+        )
+    if errors.shape != iterations.shape:
+        raise ValueError("Reconstruction history errors and iterations do not match.")
+    if _sha256_array(objects) != metadata.get("complex_array_sha256"):
+        raise ValueError("Reconstruction history complex-array hash does not match.")
+    return ReconstructionHistoryResult(
+        iterations=iterations,
+        errors=errors,
+        objects_complex_iteration_slice_xy=objects,
+        x_angstrom=x,
+        y_angstrom=y,
+        z_angstrom=z,
+        metadata=metadata,
+        output_path=source.resolve(),
+        manifest_path=manifest.resolve(),
+    )
+
+
+def analyze_oracle_depth_identifiability(
+    history: ReconstructionHistoryResult | str | Path,
+    output_path: str | Path,
+    *,
+    support_fraction_of_peak: float = 1e-4,
+    near_wrap_fraction_of_pi: float = 0.9,
+    overwrite: bool = False,
+) -> DepthIdentifiabilityResult:
+    """Measure whether oracle-initialized transmission migrates across depth.
+
+    Iteration 0 is treated as the oracle reference after physical resampling onto
+    the reconstruction grid. Correlation and scale-adjusted NRMSE use wrapped
+    phase inside an oracle-defined support. Complex-transmission departure uses
+    the full grid and is normalized by the initial signal relative to vacuum.
+    """
+    source = (
+        load_reconstruction_history(history)
+        if isinstance(history, (str, Path))
+        else history
+    )
+    if not isinstance(source, ReconstructionHistoryResult):
+        raise TypeError(
+            "history must be a ReconstructionHistoryResult or history .npz path."
+        )
+    if 0 not in source.iterations:
+        raise ValueError("Oracle depth diagnostics require a captured iteration 0.")
+    initialization = source.metadata.get("object_initialization", {})
+    if initialization.get("mode") != "provided_complex" or not initialization.get(
+        "simulation_only_truth_initialization", False
+    ):
+        raise ValueError(
+            "Oracle depth diagnostics require a simulation-only provided_complex "
+            "initializer."
+        )
+    support_fraction = _fraction_in_closed_interval(
+        support_fraction_of_peak,
+        "support_fraction_of_peak",
+        lower=0.0,
+        upper=1.0,
+        lower_inclusive=False,
+    )
+    near_wrap_fraction = _fraction_in_closed_interval(
+        near_wrap_fraction_of_pi,
+        "near_wrap_fraction_of_pi",
+        lower=0.0,
+        upper=1.0,
+        lower_inclusive=False,
+    )
+
+    objects = np.asarray(
+        source.objects_complex_iteration_slice_xy, dtype=np.complex128
+    )
+    truth_index = int(np.flatnonzero(source.iterations == 0)[0])
+    truth = objects[truth_index]
+    truth_phase = np.angle(truth)
+    truth_signal = np.abs(truth - 1.0)
+    support_threshold = max(
+        float(np.max(truth_signal)) * support_fraction,
+        np.finfo(np.float64).eps,
+    )
+    support = truth_signal >= support_threshold
+    if not np.any(support):
+        raise ValueError("Oracle initialization has no non-vacuum support.")
+
+    checkpoint_count, slice_count = objects.shape[:2]
+    phase_fractions = np.empty((checkpoint_count, slice_count), dtype=np.float64)
+    near_wrap_counts = np.empty((checkpoint_count, slice_count), dtype=np.int64)
+    oracle_correlations = np.empty(checkpoint_count, dtype=np.float64)
+    reversed_correlations = np.empty(checkpoint_count, dtype=np.float64)
+    per_slice_correlations = np.empty(
+        (checkpoint_count, slice_count), dtype=np.float64
+    )
+    global_scales = np.empty(checkpoint_count, dtype=np.float64)
+    nrmse = np.empty(checkpoint_count, dtype=np.float64)
+    departure = np.empty(checkpoint_count, dtype=np.float64)
+
+    reversed_truth_phase = truth_phase[::-1]
+    reversed_support = support[::-1]
+    truth_norm = max(
+        float(np.linalg.norm(truth_phase[support])), np.finfo(np.float64).eps
+    )
+    transmission_norm = max(
+        float(np.linalg.norm(truth - 1.0)), np.finfo(np.float64).eps
+    )
+    for checkpoint_index, candidate in enumerate(objects):
+        phase = np.angle(candidate)
+        per_slice_signal = np.sum(np.abs(phase), axis=(1, 2), dtype=np.float64)
+        signal_total = max(float(per_slice_signal.sum()), np.finfo(np.float64).eps)
+        phase_fractions[checkpoint_index] = per_slice_signal / signal_total
+        near_wrap_counts[checkpoint_index] = np.count_nonzero(
+            np.abs(phase) >= near_wrap_fraction * np.pi, axis=(1, 2)
+        )
+        oracle_correlations[checkpoint_index] = _masked_correlation(
+            phase, truth_phase, support
+        )
+        reversed_correlations[checkpoint_index] = _masked_correlation(
+            phase, reversed_truth_phase, reversed_support
+        )
+        for slice_index in range(slice_count):
+            per_slice_correlations[checkpoint_index, slice_index] = (
+                _masked_correlation(
+                    phase[slice_index],
+                    truth_phase[slice_index],
+                    support[slice_index],
+                )
+            )
+        candidate_values = phase[support]
+        truth_values = truth_phase[support]
+        denominator = float(np.dot(candidate_values, candidate_values))
+        scale = (
+            float(np.dot(candidate_values, truth_values) / denominator)
+            if denominator > np.finfo(np.float64).eps
+            else 0.0
+        )
+        global_scales[checkpoint_index] = scale
+        nrmse[checkpoint_index] = float(
+            np.linalg.norm(scale * candidate_values - truth_values) / truth_norm
+        )
+        departure[checkpoint_index] = float(
+            np.linalg.norm(candidate - truth) / transmission_norm
+        )
+
+    path = _require_suffix(output_path, ".npz")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path = path.with_suffix(".json")
+    settings = {
+        "schema": DEPTH_IDENTIFIABILITY_SCHEMA,
+        "history_fingerprint_sha256": source.metadata.get("fingerprint_sha256"),
+        "support_fraction_of_peak": support_fraction,
+        "near_wrap_fraction_of_pi": near_wrap_fraction,
+    }
+    fingerprint = _fingerprint(settings)
+    if _cache_matches(
+        path,
+        manifest_path,
+        fingerprint,
+        overwrite=overwrite,
+        schema=DEPTH_IDENTIFIABILITY_SCHEMA,
+    ):
+        return load_oracle_depth_identifiability(path)
+    metadata = {
+        **settings,
+        "fingerprint_sha256": fingerprint,
+        "history_path": str(source.output_path.resolve()),
+        "simulation_fingerprint_sha256": source.metadata.get(
+            "simulation_fingerprint_sha256"
+        ),
+        "view": source.metadata.get("view"),
+        "iterations": source.iterations.tolist(),
+        "slice_count": slice_count,
+        "support_threshold_complex_distance_from_vacuum": support_threshold,
+        "support_voxel_count": int(np.count_nonzero(support)),
+        "metric_definitions": {
+            "phase_fraction": "sum(abs(wrapped phase)) per slice / all slices",
+            "oracle_correlation": (
+                "Pearson correlation of wrapped phase against iteration 0 "
+                "inside oracle support"
+            ),
+            "reversed_oracle_correlation": (
+                "Same metric after reversing the oracle slice order"
+            ),
+            "scale_adjusted_nrmse": (
+                "NRMSE after one least-squares scalar rescales all candidate "
+                "wrapped-phase voxels inside oracle support"
+            ),
+            "transmission_departure": (
+                "L2(candidate - iteration0) / L2(iteration0 - vacuum) on full grid"
+            ),
+        },
+        "interpretation": (
+            "Simulation-only depth-identifiability diagnostic; oracle truth is "
+            "used for initialization and evaluation, never for experimental data."
+        ),
+        "software_versions": _software_versions(),
+    }
+    np.savez_compressed(
+        path,
+        iterations=source.iterations,
+        errors=source.errors,
+        phase_fractions=phase_fractions,
+        near_wrap_counts=near_wrap_counts,
+        oracle_correlations=oracle_correlations,
+        reversed_oracle_correlations=reversed_correlations,
+        per_slice_oracle_correlations=per_slice_correlations,
+        global_phase_scales=global_scales,
+        scale_adjusted_nrmse=nrmse,
+        transmission_departure=departure,
+    )
+    _write_json(manifest_path, metadata)
+    return DepthIdentifiabilityResult(
+        iterations=source.iterations,
+        errors=source.errors,
+        phase_fractions=phase_fractions,
+        near_wrap_counts=near_wrap_counts,
+        oracle_correlations=oracle_correlations,
+        reversed_oracle_correlations=reversed_correlations,
+        per_slice_oracle_correlations=per_slice_correlations,
+        global_phase_scales=global_scales,
+        scale_adjusted_nrmse=nrmse,
+        transmission_departure=departure,
+        metadata=metadata,
+        output_path=path.resolve(),
+        manifest_path=manifest_path.resolve(),
+    )
+
+
+def load_oracle_depth_identifiability(
+    path: str | Path,
+) -> DepthIdentifiabilityResult:
+    """Load a cached oracle depth-identifiability report."""
+    source = _require_suffix(path, ".npz")
+    manifest = source.with_suffix(".json")
+    if not source.is_file() or not manifest.is_file():
+        raise FileNotFoundError(f"Depth-identifiability cache is incomplete: {source}")
+    metadata = json.loads(manifest.read_text(encoding="utf-8"))
+    if metadata.get("schema") != DEPTH_IDENTIFIABILITY_SCHEMA:
+        raise ValueError("Depth-identifiability manifest has an unsupported schema.")
+    with np.load(source, allow_pickle=False) as data:
+        values = {key: np.asarray(data[key]) for key in data.files}
+    return DepthIdentifiabilityResult(
+        iterations=values["iterations"].astype(np.int64),
+        errors=values["errors"].astype(np.float64),
+        phase_fractions=values["phase_fractions"].astype(np.float64),
+        near_wrap_counts=values["near_wrap_counts"].astype(np.int64),
+        oracle_correlations=values["oracle_correlations"].astype(np.float64),
+        reversed_oracle_correlations=values[
+            "reversed_oracle_correlations"
+        ].astype(np.float64),
+        per_slice_oracle_correlations=values[
+            "per_slice_oracle_correlations"
+        ].astype(np.float64),
+        global_phase_scales=values["global_phase_scales"].astype(np.float64),
+        scale_adjusted_nrmse=values["scale_adjusted_nrmse"].astype(np.float64),
+        transmission_departure=values["transmission_departure"].astype(np.float64),
+        metadata=metadata,
+        output_path=source.resolve(),
+        manifest_path=manifest.resolve(),
+    )
+
+
+def print_oracle_depth_identifiability_summary(
+    result: DepthIdentifiabilityResult,
+) -> None:
+    """Print checkpoint metrics in a compact table."""
+    print("Oracle-initialized depth-identifiability diagnostic")
+    print("  iter       SSE   phase fraction by slice   corr  reverse   NRMSE  departure")
+    for index, iteration in enumerate(result.iterations):
+        error = result.errors[index]
+        error_text = "       -" if not np.isfinite(error) else f"{error:8.2e}"
+        fractions = ",".join(f"{value:.3f}" for value in result.phase_fractions[index])
+        per_slice = ",".join(
+            f"{value:.3f}"
+            for value in result.per_slice_oracle_correlations[index]
+        )
+        near_wrap = ",".join(
+            str(int(value)) for value in result.near_wrap_counts[index]
+        )
+        print(
+            f"  {int(iteration):4d}  {error_text}   [{fractions}]   "
+            f"{result.oracle_correlations[index]:.3f}   "
+            f"{result.reversed_oracle_correlations[index]:.3f}   "
+            f"{result.scale_adjusted_nrmse[index]:.3f}   "
+            f"{result.transmission_departure[index]:.3f}"
+        )
+        print(
+            f"          slice corr=[{per_slice}], near-wrap=[{near_wrap}], "
+            f"global phase scale={result.global_phase_scales[index]:.3g}"
+        )
+    print("  report:", result.output_path)
+
+
+def plot_oracle_depth_identifiability(
+    result: DepthIdentifiabilityResult,
+) -> tuple[Any, Any]:
+    """Plot slice-signal migration and oracle agreement across checkpoints."""
+    import matplotlib.pyplot as plt
+
+    iterations = result.iterations
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), constrained_layout=True)
+    for slice_index in range(result.phase_fractions.shape[1]):
+        axes[0].plot(
+            iterations,
+            result.phase_fractions[:, slice_index],
+            marker="o",
+            label=f"slice {slice_index}",
+        )
+    axes[0].set(
+        title="Depth-signal migration",
+        xlabel="completed iteration",
+        ylabel="fraction of |phase|",
+        ylim=(0.0, 1.0),
+    )
+    axes[0].legend()
+    axes[1].plot(
+        iterations, result.oracle_correlations, marker="o", label="oracle order"
+    )
+    axes[1].plot(
+        iterations,
+        result.reversed_oracle_correlations,
+        marker="o",
+        label="reversed oracle",
+    )
+    axes[1].set(
+        title="Depth-order agreement",
+        xlabel="completed iteration",
+        ylabel="phase correlation",
+        ylim=(-1.0, 1.0),
+    )
+    axes[1].legend()
+    axes[2].plot(
+        iterations,
+        result.scale_adjusted_nrmse,
+        marker="o",
+        label="scale-adjusted phase NRMSE",
+    )
+    axes[2].plot(
+        iterations,
+        result.transmission_departure,
+        marker="o",
+        label="complex transmission departure",
+    )
+    axes[2].set(
+        title="Departure from oracle initialization",
+        xlabel="completed iteration",
+        ylabel="normalized error",
+    )
+    axes[2].legend()
+    return fig, axes
+
+
+def plot_reconstruction_checkpoint_phases(
+    history: ReconstructionHistoryResult,
+    *,
+    cmap: str = "RdBu_r",
+) -> tuple[Any, Any]:
+    """Show every captured slice with one symmetric scale per checkpoint."""
+    import matplotlib.pyplot as plt
+
+    phase = np.angle(history.objects_complex_iteration_slice_xy)
+    rows, columns = phase.shape[:2]
+    fig, axes = plt.subplots(
+        rows,
+        columns,
+        figsize=(3.1 * columns, 2.8 * rows),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    for row in range(rows):
+        limit = max(float(np.percentile(np.abs(phase[row]), 99.9)), 1e-12)
+        fractions = np.sum(np.abs(phase[row]), axis=(1, 2), dtype=np.float64)
+        fractions /= max(float(fractions.sum()), np.finfo(np.float64).eps)
+        for column in range(columns):
+            axes[row, column].imshow(
+                phase[row, column].T,
+                origin="lower",
+                cmap=cmap,
+                vmin=-limit,
+                vmax=limit,
+            )
+            axes[row, column].set_title(
+                f"iter {int(history.iterations[row])}, slice {column}\n"
+                f"{fractions[column]:.1%} of |phase|"
+            )
+            axes[row, column].set_axis_off()
+    return fig, axes
 
 
 def print_environment_report(report: dict[str, Any]) -> None:
@@ -1477,17 +2225,160 @@ def _normalize_object_initialization(value: str) -> str:
     return mode
 
 
+def _normalize_capture_iterations(
+    value: tuple[int, ...] | list[int] | None,
+    maximum_iteration: int,
+) -> tuple[int, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes)):
+        raise TypeError("capture_iterations must be a sequence of integers or None.")
+    normalized = []
+    for iteration in value:
+        if isinstance(iteration, (bool, np.bool_)) or int(iteration) != iteration:
+            raise ValueError("capture_iterations must contain only integers.")
+        integer = int(iteration)
+        if integer < 0 or integer > maximum_iteration:
+            raise ValueError(
+                "capture_iterations values must be between 0 and "
+                f"reconstruction_iterations ({maximum_iteration})."
+            )
+        normalized.append(integer)
+    return tuple(sorted(set(normalized)))
+
+
+def _reconstruction_history_path(reconstruction_path: Path) -> Path:
+    return reconstruction_path.with_name(
+        f"{reconstruction_path.stem}_iteration_history.npz"
+    )
+
+
+def _strict_coordinate_vector(value: Any, name: str) -> np.ndarray:
+    vector = np.asarray(value, dtype=np.float64)
+    if vector.ndim != 1 or len(vector) < 2 or not np.isfinite(vector).all():
+        raise ValueError(f"{name} must contain at least two finite coordinates.")
+    if np.any(np.diff(vector) <= 0.0):
+        raise ValueError(f"{name} must be strictly increasing.")
+    return vector
+
+
+def _resample_complex_object_xy(
+    objects: np.ndarray,
+    source_x: np.ndarray,
+    source_y: np.ndarray,
+    target_x: np.ndarray,
+    target_y: np.ndarray,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Linearly interpolate complex slices in physical x/y with vacuum fill."""
+    source_x = _strict_coordinate_vector(source_x, "source x_angstrom")
+    source_y = _strict_coordinate_vector(source_y, "source y_angstrom")
+    target_x = _strict_coordinate_vector(target_x, "target x_angstrom")
+    target_y = _strict_coordinate_vector(target_y, "target y_angstrom")
+    source_array = np.asarray(objects, dtype=np.complex64)
+    if source_array.shape[1:] != (len(source_x), len(source_y)):
+        raise ValueError("Complex-object source shape does not match its x/y grid.")
+
+    same_grid = (
+        len(source_x) == len(target_x)
+        and len(source_y) == len(target_y)
+        and np.allclose(source_x, target_x, rtol=0.0, atol=1e-10)
+        and np.allclose(source_y, target_y, rtol=0.0, atol=1e-10)
+    )
+    if same_grid:
+        output = source_array.copy()
+    else:
+        from scipy.interpolate import RegularGridInterpolator
+
+        target_x_grid, target_y_grid = np.meshgrid(
+            target_x, target_y, indexing="ij"
+        )
+        query = np.column_stack((target_x_grid.ravel(), target_y_grid.ravel()))
+        output = np.empty(
+            (source_array.shape[0], len(target_x), len(target_y)),
+            dtype=np.complex64,
+        )
+        for slice_index, source_slice in enumerate(source_array):
+            real = RegularGridInterpolator(
+                (source_x, source_y),
+                source_slice.real,
+                method="linear",
+                bounds_error=False,
+                fill_value=1.0,
+            )(query)
+            imag = RegularGridInterpolator(
+                (source_x, source_y),
+                source_slice.imag,
+                method="linear",
+                bounds_error=False,
+                fill_value=0.0,
+            )(query)
+            output[slice_index] = (real + 1j * imag).reshape(
+                len(target_x), len(target_y)
+            )
+    inside_x = (target_x >= source_x[0]) & (target_x <= source_x[-1])
+    inside_y = (target_y >= source_y[0]) & (target_y <= source_y[-1])
+    inside_fraction = float(np.mean(inside_x[:, None] & inside_y[None, :]))
+    return output, {
+        "method": "none (identical grids)" if same_grid else "linear",
+        "outside_source_fill_value": "1+0j (vacuum transmission)",
+        "source_shape_xy": [len(source_x), len(source_y)],
+        "target_shape_xy": [len(target_x), len(target_y)],
+        "target_grid_fraction_inside_source_extent": inside_fraction,
+    }
+
+
+def _fraction_in_closed_interval(
+    value: float,
+    name: str,
+    *,
+    lower: float,
+    upper: float,
+    lower_inclusive: bool,
+) -> float:
+    number = float(value)
+    valid_lower = number >= lower if lower_inclusive else number > lower
+    if not np.isfinite(number) or not valid_lower or number > upper:
+        left = "[" if lower_inclusive else "("
+        raise ValueError(f"{name} must be finite and in {left}{lower}, {upper}].")
+    return number
+
+
+def _masked_correlation(
+    first: np.ndarray,
+    second: np.ndarray,
+    mask: np.ndarray,
+) -> float:
+    first_values = np.asarray(first, dtype=np.float64)[mask]
+    second_values = np.asarray(second, dtype=np.float64)[mask]
+    if len(first_values) < 2:
+        return float("nan")
+    first_values = first_values - np.mean(first_values)
+    second_values = second_values - np.mean(second_values)
+    denominator = float(
+        np.linalg.norm(first_values) * np.linalg.norm(second_values)
+    )
+    if denominator <= np.finfo(np.float64).eps:
+        return float("nan")
+    return float(np.dot(first_values, second_values) / denominator)
+
+
 def _reconstruction_object_descriptor(
     simulation: SimulationResult,
+    config: PtychographyConfig,
     mode: str,
-    source: ReconstructionResult | str | Path | None,
-) -> tuple[ReconstructionResult | None, dict[str, Any]]:
+    source: (
+        ReconstructionResult | ComplexObjectInitializationResult | str | Path | None
+    ),
+) -> tuple[
+    ReconstructionResult | ComplexObjectInitializationResult | None,
+    dict[str, Any],
+]:
     """Validate and fingerprint an object initializer before expensive work."""
     if mode == "uniform":
         if source is not None:
             raise ValueError(
                 "object_initialization_source is only valid when "
-                "object_initialization='split_projection'."
+                "object_initialization is 'split_projection' or 'provided_complex'."
             )
         return None, {
             "mode": mode,
@@ -1495,63 +2386,155 @@ def _reconstruction_object_descriptor(
         }
 
     if source is None:
-        raise ValueError(
-            "object_initialization='split_projection' requires "
-            "object_initialization_source to be a one-slice reconstruction "
-            "result or .npz path."
+        requirement = (
+            "a one-slice reconstruction result or .npz path"
+            if mode == "split_projection"
+            else "a ComplexObjectInitializationResult or initialization .npz path"
         )
+        raise ValueError(
+            f"object_initialization='{mode}' requires "
+            f"object_initialization_source to be {requirement}."
+        )
+    if mode == "split_projection":
+        if isinstance(source, (str, Path)):
+            result: ReconstructionResult | ComplexObjectInitializationResult = (
+                load_reconstruction(source)
+            )
+        elif isinstance(source, ReconstructionResult):
+            result = source
+        else:
+            raise TypeError(
+                "split_projection source must be a ReconstructionResult or a "
+                "path to a reconstruction .npz file."
+            )
+
+        objects = np.asarray(result.objects_complex_slice_xy, dtype=np.complex64)
+        if objects.ndim != 3 or objects.shape[0] != 1:
+            raise ValueError(
+                "split_projection requires a source reconstruction containing "
+                f"exactly one object slice; received shape {objects.shape}."
+            )
+        if not np.isfinite(objects.real).all() or not np.isfinite(objects.imag).all():
+            raise ValueError(
+                "split_projection source objects contain non-finite complex values."
+            )
+
+        expected_simulation = simulation.metadata.get("fingerprint_sha256")
+        source_simulation = result.metadata.get("simulation_fingerprint_sha256")
+        if not expected_simulation or source_simulation != expected_simulation:
+            raise ValueError(
+                "split_projection source and target must use the same 4D-STEM "
+                "simulation fingerprint."
+            )
+
+        source_sampling = _object_grid_vector(
+            result.metadata,
+            "object_sampling_xy_angstrom",
+        )
+        source_origin = _object_grid_vector(
+            result.metadata,
+            "object_origin_xy_angstrom",
+        )
+        descriptor = {
+            "mode": mode,
+            "source": "complex transmission from a one-slice reconstruction",
+            "source_reconstruction_fingerprint_sha256": result.metadata.get(
+                "fingerprint_sha256"
+            ),
+            "source_simulation_fingerprint_sha256": source_simulation,
+            "source_object_shape_slice_xy": list(objects.shape),
+            "source_object_sampling_xy_angstrom": source_sampling.tolist(),
+            "source_object_origin_xy_angstrom": source_origin.tolist(),
+            "source_complex_array_sha256": _sha256_array(objects),
+            "split_rule": (
+                "principal complex Nth root: abs(object)**(1/N) * "
+                "exp(1j*angle(object)/N)"
+            ),
+        }
+        return result, descriptor
+
     if isinstance(source, (str, Path)):
-        result = load_reconstruction(source)
-    elif isinstance(source, ReconstructionResult):
+        result = load_complex_object_initialization(source)
+    elif isinstance(source, ComplexObjectInitializationResult):
         result = source
     else:
         raise TypeError(
-            "object_initialization_source must be a ReconstructionResult or "
-            "a path to a reconstruction .npz file."
+            "provided_complex source must be a ComplexObjectInitializationResult "
+            "or a path to its .npz file."
         )
-
     objects = np.asarray(result.objects_complex_slice_xy, dtype=np.complex64)
-    if objects.ndim != 3 or objects.shape[0] != 1:
-        raise ValueError(
-            "split_projection requires a source reconstruction containing "
-            f"exactly one object slice; received shape {objects.shape}."
-        )
+    if objects.ndim != 3 or not objects.shape[0]:
+        raise ValueError("provided_complex source must have shape (slice,x,y).")
     if not np.isfinite(objects.real).all() or not np.isfinite(objects.imag).all():
-        raise ValueError(
-            "split_projection source objects contain non-finite complex values."
-        )
-
-    expected_simulation = simulation.metadata.get("fingerprint_sha256")
-    source_simulation = result.metadata.get("simulation_fingerprint_sha256")
-    if not expected_simulation or source_simulation != expected_simulation:
-        raise ValueError(
-            "split_projection source and target must use the same 4D-STEM "
-            "simulation fingerprint."
-        )
-
-    source_sampling = _object_grid_vector(
-        result.metadata,
-        "object_sampling_xy_angstrom",
+        raise ValueError("provided_complex source contains non-finite values.")
+    x = _strict_coordinate_vector(result.x_angstrom, "source x_angstrom")
+    y = _strict_coordinate_vector(result.y_angstrom, "source y_angstrom")
+    z_edges = _strict_coordinate_vector(
+        result.z_edges_angstrom, "source z_edges_angstrom"
     )
-    source_origin = _object_grid_vector(
-        result.metadata,
-        "object_origin_xy_angstrom",
+    if objects.shape != (len(z_edges) - 1, len(x), len(y)):
+        raise ValueError(
+            "provided_complex shape must match its z edges, x coordinates, and "
+            f"y coordinates; received {objects.shape}."
+        )
+    expected_model = simulation.metadata.get("model_fingerprint_sha256")
+    if not expected_model or result.metadata.get("model_fingerprint_sha256") != expected_model:
+        raise ValueError(
+            "provided_complex source and 4D-STEM data must use the same model "
+            "fingerprint."
+        )
+    if result.metadata.get("view") != simulation.metadata.get("view"):
+        raise ValueError(
+            "provided_complex source and 4D-STEM data must use the same view metadata."
+        )
+    source_energy = float(result.metadata.get("energy_ev", np.nan))
+    simulated_energy = float(
+        simulation.metadata.get("configuration", {}).get("energy_ev", np.nan)
     )
+    if not np.isclose(source_energy, config.energy_ev, rtol=0.0, atol=1e-9):
+        raise ValueError(
+            "provided_complex source energy does not match reconstruction energy_ev."
+        )
+    if not np.isclose(source_energy, simulated_energy, rtol=0.0, atol=1e-9):
+        raise ValueError(
+            "provided_complex source energy does not match simulated energy_ev."
+        )
+    source_potential_config = result.metadata.get("source_oracle_configuration")
+    simulation_config = simulation.metadata.get("configuration")
+    if not isinstance(source_potential_config, Mapping) or not isinstance(
+        simulation_config, Mapping
+    ):
+        raise ValueError(
+            "provided_complex source and 4D-STEM data require potential settings "
+            "in their manifests."
+        )
+    potential_keys = (
+        "potential_sampling_angstrom",
+        "potential_slice_thickness_angstrom",
+        "potential_parametrization",
+        "potential_projection",
+    )
+    mismatched_potential_keys = [
+        key
+        for key in potential_keys
+        if source_potential_config.get(key) != simulation_config.get(key)
+    ]
+    if mismatched_potential_keys:
+        raise ValueError(
+            "provided_complex oracle and 4D-STEM potential settings differ: "
+            + ", ".join(mismatched_potential_keys)
+        )
     descriptor = {
+        **dict(result.metadata),
         "mode": mode,
-        "source": "complex transmission from a one-slice reconstruction",
-        "source_reconstruction_fingerprint_sha256": result.metadata.get(
-            "fingerprint_sha256"
-        ),
-        "source_simulation_fingerprint_sha256": source_simulation,
+        "source": "physically described supplied complex transmission slices",
+        "source_output_path": str(result.output_path.resolve()),
         "source_object_shape_slice_xy": list(objects.shape),
-        "source_object_sampling_xy_angstrom": source_sampling.tolist(),
-        "source_object_origin_xy_angstrom": source_origin.tolist(),
+        "source_x_angstrom": x.tolist(),
+        "source_y_angstrom": y.tolist(),
+        "source_z_edges_angstrom": z_edges.tolist(),
         "source_complex_array_sha256": _sha256_array(objects),
-        "split_rule": (
-            "principal complex Nth root: abs(object)**(1/N) * "
-            "exp(1j*angle(object)/N)"
-        ),
+        "interpolation_method": "linear in physical x/y; vacuum fill outside source",
     }
     return result, descriptor
 
@@ -1706,8 +2689,9 @@ def _initialize_reconstruction_object(
     operator: Any,
     simulation: SimulationResult,
     descriptor: Mapping[str, Any],
-    source: ReconstructionResult | None,
+    source: ReconstructionResult | ComplexObjectInitializationResult | None,
     *,
+    target_z_edges_angstrom: np.ndarray,
     descriptor_fingerprint: str,
 ) -> dict[str, Any]:
     """Install a validated object guess after abTEM establishes its grid."""
@@ -1722,7 +2706,11 @@ def _initialize_reconstruction_object(
         simulation.metadata["scan_start_angstrom"], dtype=np.float64
     )
     target_origin = scan_start - padding_px * target_sampling
+    target_x = target_origin[0] + np.arange(target_shape[1]) * target_sampling[0]
+    target_y = target_origin[1] + np.arange(target_shape[2]) * target_sampling[1]
+    target_z_edges = np.asarray(target_z_edges_angstrom, dtype=np.float64)
     mode = str(descriptor["mode"])
+    interpolation_metadata: dict[str, Any] | None = None
 
     if mode == "split_projection":
         if source is None:
@@ -1772,6 +2760,35 @@ def _initialize_reconstruction_object(
             np.max(np.abs(recombined - source_projection)) / denominator
         )
         source_path = str(source.output_path.resolve())
+    elif mode == "provided_complex":
+        if not isinstance(source, ComplexObjectInitializationResult):
+            raise RuntimeError("Validated provided_complex source is unavailable.")
+        source_objects = np.asarray(
+            source.objects_complex_slice_xy, dtype=np.complex64
+        )
+        if source_objects.shape[0] != target_shape[0]:
+            raise ValueError(
+                "provided_complex source and reconstruction require the same "
+                f"slice count: {source_objects.shape[0]} != {target_shape[0]}."
+            )
+        source_z_edges = np.asarray(source.z_edges_angstrom, dtype=np.float64)
+        if source_z_edges.shape != target_z_edges.shape or not np.allclose(
+            source_z_edges, target_z_edges, rtol=0.0, atol=1e-7
+        ):
+            raise ValueError(
+                "provided_complex source z edges do not match the reconstruction "
+                f"slabs: {source_z_edges.tolist()} != {target_z_edges.tolist()}."
+            )
+        initial_objects, interpolation_metadata = _resample_complex_object_xy(
+            source_objects,
+            source.x_angstrom,
+            source.y_angstrom,
+            target_x,
+            target_y,
+        )
+        operator._objects = copy_to_device(initial_objects, operator._device)
+        product_relative_max_error = None
+        source_path = str(source.output_path.resolve())
     else:
         initial_objects = np.asarray(
             asnumpy(operator._objects), dtype=np.complex64
@@ -1786,9 +2803,11 @@ def _initialize_reconstruction_object(
         "target_object_shape_slice_xy": list(target_shape),
         "target_object_sampling_xy_angstrom": target_sampling.tolist(),
         "target_object_origin_xy_angstrom": target_origin.tolist(),
+        "target_z_edges_angstrom": target_z_edges.tolist(),
         "initial_complex_array_dtype": str(initial_objects.dtype),
         "initial_complex_array_sha256": _sha256_array(initial_objects),
         "recombined_source_relative_max_error": product_relative_max_error,
+        "coordinate_resampling": interpolation_metadata,
     }
 
 
