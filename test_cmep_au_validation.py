@@ -415,10 +415,11 @@ class AuValidationTests(unittest.TestCase):
                 view,
                 config,
                 Path(temp_dir) / "tiny_reconstruction.npz",
+                probe_initialization="simulation_exact",
                 object_step_size=0.25,
                 probe_step_size=0.05,
                 step_size_damping_rate=0.99,
-                probe_correction_start_iteration=1,
+                probe_correction_start_iteration=None,
                 position_correction=False,
                 verbose=False,
             )
@@ -429,15 +430,35 @@ class AuValidationTests(unittest.TestCase):
                 reconstruction.metadata["abtem_fresnel_compatibility_shim_applied"]
             )
             controls = reconstruction.metadata["reconstruction_controls"]
+            self.assertEqual(controls["probe_initialization"], "simulation_exact")
+            self.assertEqual(
+                len(controls["probe_descriptor_fingerprint_sha256"]), 64
+            )
             self.assertEqual(controls["object_step_size"], 0.25)
             self.assertEqual(controls["probe_step_size"], 0.05)
             self.assertEqual(controls["step_size_damping_rate"], 0.99)
-            self.assertEqual(controls["probe_correction_start_iteration"], 1)
+            self.assertIsNone(controls["probe_correction_start_iteration"])
             self.assertFalse(controls["position_correction"])
             self.assertEqual(
                 controls["abtem_pre_probe_correction_update_steps"],
-                controls["scan_position_count"],
+                controls["total_update_steps"] + 1,
             )
+            probe_metadata = reconstruction.metadata["probe_initialization"]
+            self.assertEqual(probe_metadata["mode"], "simulation_exact")
+            self.assertEqual(
+                probe_metadata["reconstruction_grid_gpts"],
+                list(reconstruction.probes_complex_slice_xy.shape[-2:]),
+            )
+            self.assertEqual(len(probe_metadata["complex_array_sha256"]), 64)
+            with self.assertRaisesRegex(ValueError, "probe_initialization"):
+                reconstruct_multislice_ptychography(
+                    loaded,
+                    view,
+                    config,
+                    Path(temp_dir) / "bad_probe_mode.npz",
+                    probe_initialization="unknown",
+                    verbose=False,
+                )
 
     def test_tiny_instrument_condition_applies_physical_effects(self) -> None:
         from ase import Atoms

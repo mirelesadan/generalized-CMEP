@@ -25,8 +25,10 @@ from cmep_au_model import OrientedAtomsResult, atomic_model_fingerprint
 
 SIMULATION_SCHEMA = "cmep.abtem-4dstem.v3"
 ORACLE_SCHEMA = "cmep.abtem-oracle-potential.v2"
-RECONSTRUCTION_SCHEMA = "cmep.abtem-multislice-reconstruction.v2"
+RECONSTRUCTION_SCHEMA = "cmep.abtem-multislice-reconstruction.v3"
 QC_SCHEMA = "cmep.abtem-4dstem-qc.v2"
+
+_PROBE_INITIALIZATION_MODES = {"abtem_default", "simulation_exact"}
 
 _WINDOWS_LEGACY_PATH_LIMIT = 260
 # Zarr 3 appends nested array/chunk keys and a 32-character atomic-write token.
@@ -1085,6 +1087,7 @@ def reconstruct_multislice_ptychography(
     config: PtychographyConfig,
     output_path: str | Path,
     *,
+    probe_initialization: str = "abtem_default",
     object_step_size: float = 1.0,
     probe_step_size: float = 1.0,
     step_size_damping_rate: float = 0.995,
@@ -1097,12 +1100,32 @@ def reconstruct_multislice_ptychography(
 
     abTEM's current operator is in-memory. Loading a large 8 nm 4D dataset may
     therefore require substantially more RAM/VRAM than its compressed Zarr size.
-    Step sizes and damping are forwarded to abTEM's iterative operator. Probe
-    correction can start after a whole number of scan iterations; ``None``
-    disables it. Position correction is disabled by default for exact simulated
-    scan coordinates.
+    ``probe_initialization='simulation_exact'`` rebuilds the coherent incident
+    probe encoded by the simulation manifest on the reconstruction grid before
+    the first PIE update. Step sizes and damping are forwarded to abTEM's
+    iterative operator. Probe correction can start after a whole number of scan
+    iterations; ``None`` disables it. Position correction is disabled by
+    default for exact simulated scan coordinates.
     """
     cfg = config.validated()
+    sim = (
+        load_4dstem(simulation)
+        if isinstance(simulation, (str, Path))
+        else simulation
+    )
+    probe_mode = _normalize_probe_initialization(probe_initialization)
+    probe_descriptor = _reconstruction_probe_descriptor(sim, probe_mode)
+    if probe_mode == "simulation_exact" and not np.isclose(
+        cfg.energy_ev,
+        probe_descriptor["energy_ev"],
+        rtol=0.0,
+        atol=1e-9,
+    ):
+        raise ValueError(
+            "simulation_exact probe initialization requires the reconstruction "
+            "energy_ev to match the simulated energy_ev."
+        )
+    probe_descriptor_fingerprint = _fingerprint(probe_descriptor)
     object_step = _positive_finite(object_step_size, "object_step_size")
     probe_step = _positive_finite(probe_step_size, "probe_step_size")
     damping_rate = _positive_finite(
@@ -1132,13 +1155,14 @@ def reconstruct_multislice_ptychography(
         raise TypeError("position_correction must be Boolean.")
 
     reconstruction_controls = {
+        "probe_initialization": probe_mode,
+        "probe_descriptor_fingerprint_sha256": probe_descriptor_fingerprint,
         "object_step_size": object_step,
         "probe_step_size": probe_step,
         "step_size_damping_rate": damping_rate,
         "probe_correction_start_iteration": probe_start_iteration,
         "position_correction": bool(position_correction),
     }
-    sim = load_4dstem(simulation) if isinstance(simulation, (str, Path)) else simulation
     path = _require_suffix(output_path, ".npz")
     path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path = path.with_suffix(".json")
@@ -1192,6 +1216,11 @@ def reconstruct_multislice_ptychography(
         preprocess=True,
         device=str(cfg.device).strip().lower(),
     )
+    probe_initialization_metadata = _initialize_reconstruction_probe(
+        operator,
+        probe_descriptor,
+        descriptor_fingerprint=probe_descriptor_fingerprint,
+    )
     objects, probes, positions, error = operator.reconstruct(
         max_iterations=cfg.reconstruction_iterations,
         random_seed=cfg.random_seed,
@@ -1227,6 +1256,7 @@ def reconstruct_multislice_ptychography(
         "simulation_fingerprint_sha256": sim.metadata["fingerprint_sha256"],
         "view": view.metadata,
         "configuration": cfg.to_dict(),
+        "probe_initialization": probe_initialization_metadata,
         "reconstruction_controls": {
             **reconstruction_controls,
             "scan_position_count": scan_position_count,
@@ -1393,6 +1423,152 @@ def _make_potential(
         periodic=False,
         device=str(config.device).strip().lower(),
     )
+
+
+def _normalize_probe_initialization(value: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError("probe_initialization must be a string.")
+    mode = value.strip().lower()
+    if mode not in _PROBE_INITIALIZATION_MODES:
+        allowed = ", ".join(sorted(_PROBE_INITIALIZATION_MODES))
+        raise ValueError(f"probe_initialization must be one of: {allowed}.")
+    return mode
+
+
+def _reconstruction_probe_descriptor(
+    simulation: SimulationResult,
+    mode: str,
+) -> dict[str, Any]:
+    """Describe the incident probe source before loading diffraction data."""
+    if not isinstance(simulation, SimulationResult):
+        raise TypeError("simulation must be a SimulationResult or a 4D-STEM path.")
+    if mode == "abtem_default":
+        return {
+            "mode": mode,
+            "source": "abTEM MultislicePtychographicOperator default initializer",
+        }
+
+    raw_config = simulation.metadata.get("configuration")
+    if not isinstance(raw_config, Mapping):
+        raise ValueError(
+            "simulation_exact probe initialization requires configuration "
+            "metadata in the 4D-STEM manifest."
+        )
+    required = {
+        "energy_ev",
+        "semiangle_mrad",
+        "probe_aperture_soft",
+        "beam_tilt_mrad",
+        "probe_aberrations",
+    }
+    missing = sorted(required - set(raw_config))
+    if missing:
+        raise ValueError(
+            "The 4D-STEM manifest lacks probe settings required for "
+            "simulation_exact initialization: " + ", ".join(missing)
+        )
+
+    energy = _positive_finite(raw_config["energy_ev"], "simulated energy_ev")
+    semiangle = _positive_finite(
+        raw_config["semiangle_mrad"], "simulated semiangle_mrad"
+    )
+    soft = raw_config["probe_aperture_soft"]
+    if not isinstance(soft, (bool, np.bool_)):
+        raise TypeError("Simulated probe_aperture_soft metadata must be Boolean.")
+    tilt = np.asarray(raw_config["beam_tilt_mrad"], dtype=np.float64)
+    if tilt.shape != (2,) or not np.isfinite(tilt).all():
+        raise ValueError(
+            "Simulated beam_tilt_mrad metadata must contain two finite values."
+        )
+    raw_aberrations = raw_config["probe_aberrations"]
+    if raw_aberrations is None:
+        aberrations = None
+    elif isinstance(raw_aberrations, Mapping):
+        aberrations = {
+            str(key): float(value)
+            for key, value in sorted(raw_aberrations.items())
+        }
+        if any(not np.isfinite(value) for value in aberrations.values()):
+            raise ValueError("Simulated probe aberrations must be finite.")
+    else:
+        raise TypeError(
+            "Simulated probe_aberrations metadata must be a mapping or None."
+        )
+
+    source_sigma = float(
+        raw_config.get("partial_coherence_source_sigma_angstrom", 0.0)
+    )
+    if not np.isfinite(source_sigma) or source_sigma < 0.0:
+        raise ValueError(
+            "Simulated partial_coherence_source_sigma_angstrom must be finite "
+            "and non-negative."
+        )
+    return {
+        "mode": mode,
+        "source": "coherent incident-probe model from the 4D-STEM manifest",
+        "simulation_fingerprint_sha256": simulation.metadata.get(
+            "fingerprint_sha256"
+        ),
+        "energy_ev": energy,
+        "semiangle_mrad": semiangle,
+        "probe_aperture_soft": bool(soft),
+        "beam_tilt_mrad": tilt.tolist(),
+        "probe_aberrations": aberrations,
+        "partial_coherence_source_sigma_angstrom": source_sigma,
+        "partial_coherence_note": (
+            "This is the nominal coherent probe before Gaussian source-size mixing."
+            if source_sigma > 0.0
+            else "No source-size mixing was applied."
+        ),
+    }
+
+
+def _initialize_reconstruction_probe(
+    operator: Any,
+    descriptor: Mapping[str, Any],
+    *,
+    descriptor_fingerprint: str,
+) -> dict[str, Any]:
+    """Install and fingerprint the requested entrance probe before PIE updates."""
+    mode = str(descriptor["mode"])
+    if mode == "simulation_exact":
+        from abtem import Probe
+
+        # abTEM exposes the reconstruction sampling only after preprocessing.
+        # Rebuilding on that reciprocal-space grid retains the simulated CTF
+        # while matching the detector-limited reconstruction dimensions.
+        rebuilt = Probe(
+            energy=float(descriptor["energy_ev"]),
+            semiangle_cutoff=float(descriptor["semiangle_mrad"]),
+            soft=bool(descriptor["probe_aperture_soft"]),
+            gpts=tuple(
+                int(value) for value in operator._region_of_interest_shape
+            ),
+            sampling=tuple(float(value) for value in operator.sampling),
+            tilt=tuple(float(value) for value in descriptor["beam_tilt_mrad"]),
+            aberrations=descriptor["probe_aberrations"],
+            device=str(operator._device),
+        ).build(lazy=False).array
+        if tuple(rebuilt.shape) != tuple(operator._probes[0].shape):
+            raise RuntimeError(
+                "Rebuilt simulation probe shape does not match the reconstruction "
+                f"grid: {rebuilt.shape} != {operator._probes[0].shape}."
+            )
+        operator._probes[0] = rebuilt
+
+    from abtem.core.backend import asnumpy
+
+    initial_probe = np.asarray(asnumpy(operator._probes[0]), dtype=np.complex64)
+    return {
+        **dict(descriptor),
+        "descriptor_fingerprint_sha256": descriptor_fingerprint,
+        "reconstruction_grid_gpts": [int(value) for value in initial_probe.shape],
+        "reconstruction_sampling_angstrom": [
+            float(value) for value in operator.sampling
+        ],
+        "complex_array_dtype": str(initial_probe.dtype),
+        "complex_array_sha256": _sha256_array(initial_probe),
+    }
 
 
 def _make_probe_scan_detector(
@@ -1767,6 +1943,15 @@ def _fingerprint(value: Any) -> str:
         value, sort_keys=True, separators=(",", ":"), allow_nan=False
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _sha256_array(value: np.ndarray) -> str:
+    array = np.ascontiguousarray(value)
+    digest = hashlib.sha256()
+    digest.update(str(array.dtype).encode("ascii"))
+    digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+    digest.update(array.view(np.uint8).tobytes())
+    return digest.hexdigest()
 
 
 def _write_json(path: Path, value: Any) -> None:
