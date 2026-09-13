@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -410,12 +411,34 @@ class AuValidationTests(unittest.TestCase):
             import matplotlib.pyplot as plt
 
             plt.close(figure)
+            one_slice_config = replace(
+                config,
+                reconstruction_slice_thickness_angstrom=float(
+                    view.atoms.cell.lengths()[2]
+                ),
+            )
+            one_slice_reconstruction = reconstruct_multislice_ptychography(
+                loaded,
+                view,
+                one_slice_config,
+                Path(temp_dir) / "tiny_one_slice_reconstruction.npz",
+                probe_initialization="simulation_exact",
+                probe_correction_start_iteration=None,
+                verbose=False,
+            )
+            self.assertEqual(
+                one_slice_reconstruction.objects_complex_slice_xy.shape[0], 1
+            )
             reconstruction = reconstruct_multislice_ptychography(
                 loaded,
                 view,
                 config,
                 Path(temp_dir) / "tiny_reconstruction.npz",
                 probe_initialization="simulation_exact",
+                object_initialization="split_projection",
+                object_initialization_source=(
+                    one_slice_reconstruction.output_path
+                ),
                 object_step_size=0.25,
                 probe_step_size=0.05,
                 step_size_damping_rate=0.99,
@@ -427,10 +450,18 @@ class AuValidationTests(unittest.TestCase):
             self.assertTrue(np.isfinite(reconstruction.phase_stack_slice_row_col).all())
             self.assertTrue(np.isfinite(reconstruction.error))
             self.assertTrue(
-                reconstruction.metadata["abtem_fresnel_compatibility_shim_applied"]
+                one_slice_reconstruction.metadata[
+                    "abtem_fresnel_compatibility_shim_applied"
+                ]
+                or reconstruction.metadata[
+                    "abtem_fresnel_compatibility_shim_applied"
+                ]
             )
             controls = reconstruction.metadata["reconstruction_controls"]
             self.assertEqual(controls["probe_initialization"], "simulation_exact")
+            self.assertEqual(
+                controls["object_initialization"], "split_projection"
+            )
             self.assertEqual(
                 len(controls["probe_descriptor_fingerprint_sha256"]), 64
             )
@@ -450,6 +481,21 @@ class AuValidationTests(unittest.TestCase):
                 list(reconstruction.probes_complex_slice_xy.shape[-2:]),
             )
             self.assertEqual(len(probe_metadata["complex_array_sha256"]), 64)
+            object_metadata = reconstruction.metadata["object_initialization"]
+            self.assertEqual(object_metadata["mode"], "split_projection")
+            self.assertEqual(
+                object_metadata["source_object_shape_slice_xy"][0], 1
+            )
+            self.assertEqual(
+                object_metadata["target_object_shape_slice_xy"],
+                list(reconstruction.objects_complex_slice_xy.shape),
+            )
+            self.assertLess(
+                object_metadata["recombined_source_relative_max_error"], 1e-6
+            )
+            self.assertEqual(
+                len(object_metadata["initial_complex_array_sha256"]), 64
+            )
             with self.assertRaisesRegex(ValueError, "probe_initialization"):
                 reconstruct_multislice_ptychography(
                     loaded,
@@ -457,6 +503,24 @@ class AuValidationTests(unittest.TestCase):
                     config,
                     Path(temp_dir) / "bad_probe_mode.npz",
                     probe_initialization="unknown",
+                    verbose=False,
+                )
+            with self.assertRaisesRegex(ValueError, "object_initialization"):
+                reconstruct_multislice_ptychography(
+                    loaded,
+                    view,
+                    config,
+                    Path(temp_dir) / "bad_object_mode.npz",
+                    object_initialization="unknown",
+                    verbose=False,
+                )
+            with self.assertRaisesRegex(ValueError, "requires"):
+                reconstruct_multislice_ptychography(
+                    loaded,
+                    view,
+                    config,
+                    Path(temp_dir) / "missing_object_source.npz",
+                    object_initialization="split_projection",
                     verbose=False,
                 )
 

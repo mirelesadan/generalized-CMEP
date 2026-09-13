@@ -29,6 +29,7 @@ RECONSTRUCTION_SCHEMA = "cmep.abtem-multislice-reconstruction.v3"
 QC_SCHEMA = "cmep.abtem-4dstem-qc.v2"
 
 _PROBE_INITIALIZATION_MODES = {"abtem_default", "simulation_exact"}
+_OBJECT_INITIALIZATION_MODES = {"uniform", "split_projection"}
 
 _WINDOWS_LEGACY_PATH_LIMIT = 260
 # Zarr 3 appends nested array/chunk keys and a 32-character atomic-write token.
@@ -1088,6 +1089,8 @@ def reconstruct_multislice_ptychography(
     output_path: str | Path,
     *,
     probe_initialization: str = "abtem_default",
+    object_initialization: str = "uniform",
+    object_initialization_source: ReconstructionResult | str | Path | None = None,
     object_step_size: float = 1.0,
     probe_step_size: float = 1.0,
     step_size_damping_rate: float = 0.995,
@@ -1102,10 +1105,13 @@ def reconstruct_multislice_ptychography(
     therefore require substantially more RAM/VRAM than its compressed Zarr size.
     ``probe_initialization='simulation_exact'`` rebuilds the coherent incident
     probe encoded by the simulation manifest on the reconstruction grid before
-    the first PIE update. Step sizes and damping are forwarded to abTEM's
-    iterative operator. Probe correction can start after a whole number of scan
-    iterations; ``None`` disables it. Position correction is disabled by
-    default for exact simulated scan coordinates.
+    the first PIE update. ``object_initialization='split_projection'`` requires
+    a compatible one-slice reconstruction and distributes its complex
+    transmission evenly across the requested target slices. Step sizes and
+    damping are forwarded to abTEM's iterative operator. Probe correction can
+    start after a whole number of scan iterations; ``None`` disables it.
+    Position correction is disabled by default for exact simulated scan
+    coordinates.
     """
     cfg = config.validated()
     sim = (
@@ -1126,6 +1132,13 @@ def reconstruct_multislice_ptychography(
             "energy_ev to match the simulated energy_ev."
         )
     probe_descriptor_fingerprint = _fingerprint(probe_descriptor)
+    object_mode = _normalize_object_initialization(object_initialization)
+    object_source, object_descriptor = _reconstruction_object_descriptor(
+        sim,
+        object_mode,
+        object_initialization_source,
+    )
+    object_descriptor_fingerprint = _fingerprint(object_descriptor)
     object_step = _positive_finite(object_step_size, "object_step_size")
     probe_step = _positive_finite(probe_step_size, "probe_step_size")
     damping_rate = _positive_finite(
@@ -1154,7 +1167,7 @@ def reconstruct_multislice_ptychography(
     if not isinstance(position_correction, (bool, np.bool_)):
         raise TypeError("position_correction must be Boolean.")
 
-    reconstruction_controls = {
+    base_reconstruction_controls = {
         "probe_initialization": probe_mode,
         "probe_descriptor_fingerprint_sha256": probe_descriptor_fingerprint,
         "object_step_size": object_step,
@@ -1163,6 +1176,17 @@ def reconstruct_multislice_ptychography(
         "probe_correction_start_iteration": probe_start_iteration,
         "position_correction": bool(position_correction),
     }
+    reconstruction_controls = {
+        **base_reconstruction_controls,
+        "object_initialization": object_mode,
+        "object_descriptor_fingerprint_sha256": object_descriptor_fingerprint,
+    }
+    # Preserve cache compatibility for the historical deterministic initializer.
+    fingerprint_controls = (
+        base_reconstruction_controls
+        if object_mode == "uniform"
+        else reconstruction_controls
+    )
     path = _require_suffix(output_path, ".npz")
     path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path = path.with_suffix(".json")
@@ -1172,7 +1196,7 @@ def reconstruct_multislice_ptychography(
             "simulation_fingerprint": sim.metadata["fingerprint_sha256"],
             "view": view.metadata,
             "configuration": cfg.to_dict(),
-            "reconstruction_controls": reconstruction_controls,
+            "reconstruction_controls": fingerprint_controls,
         }
     )
     if _cache_matches(
@@ -1221,6 +1245,13 @@ def reconstruct_multislice_ptychography(
         probe_descriptor,
         descriptor_fingerprint=probe_descriptor_fingerprint,
     )
+    object_initialization_metadata = _initialize_reconstruction_object(
+        operator,
+        sim,
+        object_descriptor,
+        object_source,
+        descriptor_fingerprint=object_descriptor_fingerprint,
+    )
     objects, probes, positions, error = operator.reconstruct(
         max_iterations=cfg.reconstruction_iterations,
         random_seed=cfg.random_seed,
@@ -1257,6 +1288,7 @@ def reconstruct_multislice_ptychography(
         "view": view.metadata,
         "configuration": cfg.to_dict(),
         "probe_initialization": probe_initialization_metadata,
+        "object_initialization": object_initialization_metadata,
         "reconstruction_controls": {
             **reconstruction_controls,
             "scan_position_count": scan_position_count,
@@ -1435,6 +1467,105 @@ def _normalize_probe_initialization(value: str) -> str:
     return mode
 
 
+def _normalize_object_initialization(value: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError("object_initialization must be a string.")
+    mode = value.strip().lower()
+    if mode not in _OBJECT_INITIALIZATION_MODES:
+        allowed = ", ".join(sorted(_OBJECT_INITIALIZATION_MODES))
+        raise ValueError(f"object_initialization must be one of: {allowed}.")
+    return mode
+
+
+def _reconstruction_object_descriptor(
+    simulation: SimulationResult,
+    mode: str,
+    source: ReconstructionResult | str | Path | None,
+) -> tuple[ReconstructionResult | None, dict[str, Any]]:
+    """Validate and fingerprint an object initializer before expensive work."""
+    if mode == "uniform":
+        if source is not None:
+            raise ValueError(
+                "object_initialization_source is only valid when "
+                "object_initialization='split_projection'."
+            )
+        return None, {
+            "mode": mode,
+            "source": "abTEM unit-transmission initializer",
+        }
+
+    if source is None:
+        raise ValueError(
+            "object_initialization='split_projection' requires "
+            "object_initialization_source to be a one-slice reconstruction "
+            "result or .npz path."
+        )
+    if isinstance(source, (str, Path)):
+        result = load_reconstruction(source)
+    elif isinstance(source, ReconstructionResult):
+        result = source
+    else:
+        raise TypeError(
+            "object_initialization_source must be a ReconstructionResult or "
+            "a path to a reconstruction .npz file."
+        )
+
+    objects = np.asarray(result.objects_complex_slice_xy, dtype=np.complex64)
+    if objects.ndim != 3 or objects.shape[0] != 1:
+        raise ValueError(
+            "split_projection requires a source reconstruction containing "
+            f"exactly one object slice; received shape {objects.shape}."
+        )
+    if not np.isfinite(objects.real).all() or not np.isfinite(objects.imag).all():
+        raise ValueError(
+            "split_projection source objects contain non-finite complex values."
+        )
+
+    expected_simulation = simulation.metadata.get("fingerprint_sha256")
+    source_simulation = result.metadata.get("simulation_fingerprint_sha256")
+    if not expected_simulation or source_simulation != expected_simulation:
+        raise ValueError(
+            "split_projection source and target must use the same 4D-STEM "
+            "simulation fingerprint."
+        )
+
+    source_sampling = _object_grid_vector(
+        result.metadata,
+        "object_sampling_xy_angstrom",
+    )
+    source_origin = _object_grid_vector(
+        result.metadata,
+        "object_origin_xy_angstrom",
+    )
+    descriptor = {
+        "mode": mode,
+        "source": "complex transmission from a one-slice reconstruction",
+        "source_reconstruction_fingerprint_sha256": result.metadata.get(
+            "fingerprint_sha256"
+        ),
+        "source_simulation_fingerprint_sha256": source_simulation,
+        "source_object_shape_slice_xy": list(objects.shape),
+        "source_object_sampling_xy_angstrom": source_sampling.tolist(),
+        "source_object_origin_xy_angstrom": source_origin.tolist(),
+        "source_complex_array_sha256": _sha256_array(objects),
+        "split_rule": (
+            "principal complex Nth root: abs(object)**(1/N) * "
+            "exp(1j*angle(object)/N)"
+        ),
+    }
+    return result, descriptor
+
+
+def _object_grid_vector(metadata: Mapping[str, Any], key: str) -> np.ndarray:
+    raw = metadata.get(key)
+    vector = np.asarray(raw, dtype=np.float64) if raw is not None else np.empty(0)
+    if vector.shape != (2,) or not np.isfinite(vector).all():
+        raise ValueError(
+            f"Source reconstruction metadata must contain two finite {key} values."
+        )
+    return vector
+
+
 def _reconstruction_probe_descriptor(
     simulation: SimulationResult,
     mode: str,
@@ -1568,6 +1699,96 @@ def _initialize_reconstruction_probe(
         ],
         "complex_array_dtype": str(initial_probe.dtype),
         "complex_array_sha256": _sha256_array(initial_probe),
+    }
+
+
+def _initialize_reconstruction_object(
+    operator: Any,
+    simulation: SimulationResult,
+    descriptor: Mapping[str, Any],
+    source: ReconstructionResult | None,
+    *,
+    descriptor_fingerprint: str,
+) -> dict[str, Any]:
+    """Install a validated object guess after abTEM establishes its grid."""
+    from abtem.core.backend import asnumpy, copy_to_device
+
+    target_shape = tuple(int(value) for value in operator._objects.shape)
+    target_sampling = np.asarray(operator.sampling, dtype=np.float64)
+    padding_px = np.asarray(
+        operator._experimental_parameters["object_px_padding"], dtype=np.float64
+    )
+    scan_start = np.asarray(
+        simulation.metadata["scan_start_angstrom"], dtype=np.float64
+    )
+    target_origin = scan_start - padding_px * target_sampling
+    mode = str(descriptor["mode"])
+
+    if mode == "split_projection":
+        if source is None:
+            raise RuntimeError("Validated split_projection source is unavailable.")
+        source_objects = np.asarray(
+            source.objects_complex_slice_xy, dtype=np.complex64
+        )
+        source_projection = source_objects[0]
+        if tuple(source_projection.shape) != target_shape[1:]:
+            raise ValueError(
+                "split_projection source and target object grids have different "
+                f"shapes: {source_projection.shape} != {target_shape[1:]}."
+            )
+        source_sampling = np.asarray(
+            descriptor["source_object_sampling_xy_angstrom"], dtype=np.float64
+        )
+        source_origin = np.asarray(
+            descriptor["source_object_origin_xy_angstrom"], dtype=np.float64
+        )
+        if not np.allclose(source_sampling, target_sampling, rtol=0.0, atol=1e-9):
+            raise ValueError(
+                "split_projection source and target object sampling do not match: "
+                f"{source_sampling.tolist()} != {target_sampling.tolist()}."
+            )
+        if not np.allclose(source_origin, target_origin, rtol=0.0, atol=1e-8):
+            raise ValueError(
+                "split_projection source and target object origins do not match: "
+                f"{source_origin.tolist()} != {target_origin.tolist()}."
+            )
+
+        num_slices = target_shape[0]
+        amplitude_root = np.power(
+            np.abs(source_projection).astype(np.float64), 1.0 / num_slices
+        )
+        phase_root = np.angle(source_projection).astype(np.float64) / num_slices
+        initial_slice = amplitude_root * np.exp(1j * phase_root)
+        initial_objects = np.repeat(
+            initial_slice[np.newaxis, :, :], num_slices, axis=0
+        ).astype(np.complex64)
+        operator._objects = copy_to_device(initial_objects, operator._device)
+
+        recombined = np.prod(initial_objects.astype(np.complex128), axis=0)
+        denominator = max(
+            float(np.max(np.abs(source_projection))), np.finfo(np.float64).eps
+        )
+        product_relative_max_error = float(
+            np.max(np.abs(recombined - source_projection)) / denominator
+        )
+        source_path = str(source.output_path.resolve())
+    else:
+        initial_objects = np.asarray(
+            asnumpy(operator._objects), dtype=np.complex64
+        )
+        product_relative_max_error = None
+        source_path = None
+
+    return {
+        **dict(descriptor),
+        "descriptor_fingerprint_sha256": descriptor_fingerprint,
+        "source_output_path": source_path,
+        "target_object_shape_slice_xy": list(target_shape),
+        "target_object_sampling_xy_angstrom": target_sampling.tolist(),
+        "target_object_origin_xy_angstrom": target_origin.tolist(),
+        "initial_complex_array_dtype": str(initial_objects.dtype),
+        "initial_complex_array_sha256": _sha256_array(initial_objects),
+        "recombined_source_relative_max_error": product_relative_max_error,
     }
 
 
