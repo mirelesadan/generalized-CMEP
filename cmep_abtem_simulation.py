@@ -33,6 +33,7 @@ DEPTH_IDENTIFIABILITY_SCHEMA = "cmep.abtem-depth-identifiability.v1"
 
 _PROBE_INITIALIZATION_MODES = {"abtem_default", "simulation_exact"}
 _OBJECT_INITIALIZATION_MODES = {"uniform", "split_projection", "provided_complex"}
+_OBJECT_CONSTRAINT_MODES = {"none", "pure_phase", "pure_phase_positive"}
 
 _WINDOWS_LEGACY_PATH_LIMIT = 260
 # Zarr 3 appends nested array/chunk keys and a 32-character atomic-write token.
@@ -1327,6 +1328,9 @@ def reconstruct_multislice_ptychography(
     step_size_damping_rate: float = 0.995,
     probe_correction_start_iteration: int | None = 0,
     position_correction: bool = False,
+    object_constraint: str = "none",
+    phase_sign: int = 1,
+    vacuum_guard_slices: tuple[int, int] = (0, 0),
     capture_iterations: tuple[int, ...] | list[int] | None = None,
     overwrite: bool = False,
     verbose: bool = True,
@@ -1344,10 +1348,15 @@ def reconstruct_multislice_ptychography(
     complex slices and linearly resamples only their in-plane coordinates onto
     the reconstruction grid. ``capture_iterations`` stores selected states from
     one run; iteration 0 is the initialized object before any PIE update. Step
-    sizes and damping are forwarded to abTEM's iterative operator. Probe
-    correction can start after a whole number of scan iterations; ``None``
-    disables it. Position correction is disabled by default for exact simulated
-    scan coordinates.
+    sizes and damping are forwarded to abTEM's iterative operator. Optional
+    object constraints are applied after initialization and after every complete
+    MS-PIE iteration. ``pure_phase`` forces unit amplitude, while
+    ``pure_phase_positive`` additionally retains only the phase polarity selected
+    by ``phase_sign``. ``vacuum_guard_slices=(entrance, exit)`` freezes terminal
+    depth slices to vacuum transmission. Probe correction can start after a whole
+    number of scan iterations; ``None`` disables it. Position correction is
+    disabled by default for exact simulated scan coordinates and is not currently
+    combined with iteration-level object constraints.
     """
     cfg = config.validated()
     sim = (
@@ -1403,6 +1412,19 @@ def reconstruct_multislice_ptychography(
         probe_start_iteration = None
     if not isinstance(position_correction, (bool, np.bool_)):
         raise TypeError("position_correction must be Boolean.")
+    constraint_mode = _normalize_object_constraint(object_constraint)
+    normalized_phase_sign = _normalize_phase_sign(phase_sign)
+    normalized_vacuum_guards = _normalize_vacuum_guard_slices(
+        vacuum_guard_slices
+    )
+    constraints_active = (
+        constraint_mode != "none" or normalized_vacuum_guards != (0, 0)
+    )
+    if constraints_active and position_correction:
+        raise ValueError(
+            "position_correction is not supported with iteration-level object "
+            "constraints. Disable position correction for constrained runs."
+        )
     checkpoint_iterations = _normalize_capture_iterations(
         capture_iterations, cfg.reconstruction_iterations
     )
@@ -1421,6 +1443,15 @@ def reconstruct_multislice_ptychography(
         "object_initialization": object_mode,
         "object_descriptor_fingerprint_sha256": object_descriptor_fingerprint,
     }
+    if constraints_active:
+        reconstruction_controls["object_constraint"] = constraint_mode
+        reconstruction_controls["phase_sign"] = normalized_phase_sign
+        reconstruction_controls["vacuum_guard_slices"] = list(
+            normalized_vacuum_guards
+        )
+        reconstruction_controls["constraint_application"] = (
+            "after initialization and after every completed MS-PIE iteration"
+        )
     if checkpoint_iterations:
         reconstruction_controls["capture_iterations"] = list(
             checkpoint_iterations
@@ -1428,7 +1459,7 @@ def reconstruct_multislice_ptychography(
     # Preserve cache compatibility for the historical deterministic initializer.
     fingerprint_controls = (
         base_reconstruction_controls
-        if object_mode == "uniform"
+        if object_mode == "uniform" and not constraints_active
         else reconstruction_controls
     )
     path = _require_suffix(output_path, ".npz")
@@ -1474,6 +1505,11 @@ def reconstruct_multislice_ptychography(
         1, int(round(cell_z / cfg.reconstruction_slice_thickness_angstrom))
     )
     slice_thickness = cell_z / num_slices
+    if sum(normalized_vacuum_guards) >= num_slices:
+        raise ValueError(
+            "vacuum_guard_slices must leave at least one reconstructable depth slice; "
+            f"received {normalized_vacuum_guards} for {num_slices} slices."
+        )
 
     compatibility_shim_applied = _ensure_abtem_reconstruction_compatibility()
     from abtem.reconstruct import MultislicePtychographicOperator
@@ -1502,6 +1538,27 @@ def reconstruct_multislice_ptychography(
         ),
         descriptor_fingerprint=object_descriptor_fingerprint,
     )
+    constraint_metadata = {
+        "active": constraints_active,
+        "mode": constraint_mode,
+        "phase_sign": normalized_phase_sign,
+        "vacuum_guard_slices": list(normalized_vacuum_guards),
+        "application": (
+            "after initialization and after every completed MS-PIE iteration"
+            if constraints_active
+            else None
+        ),
+        "guard_value": "1+0j vacuum transmission",
+        "phase_representation": "wrapped angle in [-pi, pi]",
+    }
+    if constraints_active:
+        operator._objects = _apply_object_constraint_array(
+            operator._objects,
+            mode=constraint_mode,
+            phase_sign=normalized_phase_sign,
+            vacuum_guard_slices=normalized_vacuum_guards,
+        )
+
     initial_object_array: np.ndarray | None = None
     if checkpoint_iterations:
         from abtem.core.backend import asnumpy
@@ -1509,38 +1566,110 @@ def reconstruct_multislice_ptychography(
         initial_object_array = np.asarray(
             asnumpy(operator._objects), dtype=np.complex64
         ).copy()
-    reconstruction_output = operator.reconstruct(
-        max_iterations=cfg.reconstruction_iterations,
-        return_iterations=bool(checkpoint_iterations),
-        random_seed=cfg.random_seed,
-        verbose=verbose,
-        parameters={
-            "object_step_size": object_step,
-            "probe_step_size": probe_step,
-            "step_size_damping_rate": damping_rate,
-            "pre_probe_correction_update_steps": (
-                pre_probe_correction_update_steps
-            ),
-            "pre_position_correction_update_steps": (
-                pre_position_correction_update_steps
-            ),
-        },
-    )
-    if checkpoint_iterations:
-        object_iterations, probe_iterations, position_iterations, error_iterations = (
-            reconstruction_output
+    constrained_checkpoints: dict[int, np.ndarray] = {}
+    constrained_checkpoint_errors: dict[int, float] = {}
+    if constraints_active:
+        from abtem.core.backend import asnumpy
+
+        if initial_object_array is not None:
+            constrained_checkpoints[0] = initial_object_array
+            constrained_checkpoint_errors[0] = np.nan
+        if verbose:
+            print(
+                "Constrained ptychographic reconstruction will perform "
+                f"{cfg.reconstruction_iterations} MS-PIE iterations."
+            )
+        iteration_width = len(str(cfg.reconstruction_iterations))
+        error = np.nan
+        for iteration_index in range(cfg.reconstruction_iterations):
+            if (
+                probe_start_iteration is None
+                or iteration_index < probe_start_iteration
+            ):
+                epoch_pre_probe_correction_steps = scan_position_count + 1
+            else:
+                epoch_pre_probe_correction_steps = None
+            _, _, _, epoch_error = operator.reconstruct(
+                max_iterations=1,
+                return_iterations=False,
+                random_seed=(cfg.random_seed if iteration_index == 0 else None),
+                verbose=False,
+                parameters={
+                    "object_step_size": (
+                        object_step * damping_rate**iteration_index
+                    ),
+                    "probe_step_size": probe_step * damping_rate**iteration_index,
+                    "step_size_damping_rate": damping_rate,
+                    "pre_probe_correction_update_steps": (
+                        epoch_pre_probe_correction_steps
+                    ),
+                    "pre_position_correction_update_steps": None,
+                },
+            )
+            error = float(epoch_error)
+            operator._objects = _apply_object_constraint_array(
+                operator._objects,
+                mode=constraint_mode,
+                phase_sign=normalized_phase_sign,
+                vacuum_guard_slices=normalized_vacuum_guards,
+            )
+            completed_iteration = iteration_index + 1
+            if completed_iteration in checkpoint_iterations:
+                constrained_checkpoints[completed_iteration] = np.asarray(
+                    asnumpy(operator._objects), dtype=np.complex64
+                ).copy()
+                constrained_checkpoint_errors[completed_iteration] = error
+            if verbose:
+                print(
+                    f"----Constrained iteration {iteration_index:<{iteration_width}}, "
+                    f"SSE = {error:.3e}"
+                )
+
+        object_array = np.asarray(
+            asnumpy(operator._objects), dtype=np.complex64
         )
-        objects = object_iterations[-1]
-        probes = probe_iterations[-1]
-        positions = position_iterations[-1]
-        error = error_iterations[-1]
+        probe_array = np.asarray(asnumpy(operator._probes), dtype=np.complex64)
+        positions_array = np.asarray(
+            asnumpy(operator._positions_px), dtype=np.float64
+        ) * np.asarray(operator.sampling, dtype=np.float64)
+        sampling = tuple(float(value) for value in operator.sampling)
     else:
-        objects, probes, positions, error = reconstruction_output
-    object_array = np.asarray(objects.array, dtype=np.complex64)
-    probe_array = np.asarray(probes.array, dtype=np.complex64)
-    positions_array = np.asarray(positions, dtype=np.float64)
+        reconstruction_output = operator.reconstruct(
+            max_iterations=cfg.reconstruction_iterations,
+            return_iterations=bool(checkpoint_iterations),
+            random_seed=cfg.random_seed,
+            verbose=verbose,
+            parameters={
+                "object_step_size": object_step,
+                "probe_step_size": probe_step,
+                "step_size_damping_rate": damping_rate,
+                "pre_probe_correction_update_steps": (
+                    pre_probe_correction_update_steps
+                ),
+                "pre_position_correction_update_steps": (
+                    pre_position_correction_update_steps
+                ),
+            },
+        )
+        if checkpoint_iterations:
+            (
+                object_iterations,
+                probe_iterations,
+                position_iterations,
+                error_iterations,
+            ) = reconstruction_output
+            objects = object_iterations[-1]
+            probes = probe_iterations[-1]
+            positions = position_iterations[-1]
+            error = error_iterations[-1]
+        else:
+            objects, probes, positions, error = reconstruction_output
+        object_array = np.asarray(objects.array, dtype=np.complex64)
+        probe_array = np.asarray(probes.array, dtype=np.complex64)
+        positions_array = np.asarray(positions, dtype=np.float64)
+        sampling = tuple(float(value) for value in objects.sampling)
+
     phase_stack = np.transpose(np.angle(object_array), (0, 2, 1)).astype(np.float32)
-    sampling = tuple(float(value) for value in objects.sampling)
     padding_px = np.asarray(
         operator._experimental_parameters["object_px_padding"], dtype=np.float64
     )
@@ -1556,7 +1685,10 @@ def reconstruct_multislice_ptychography(
         selected_objects = []
         selected_errors = []
         for iteration in checkpoint_iterations:
-            if iteration == 0:
+            if constraints_active:
+                selected_objects.append(constrained_checkpoints[iteration])
+                selected_errors.append(constrained_checkpoint_errors[iteration])
+            elif iteration == 0:
                 selected_objects.append(initial_object_array)
                 selected_errors.append(np.nan)
             else:
@@ -1586,9 +1718,21 @@ def reconstruct_multislice_ptychography(
             "view": view.metadata,
             "configuration": cfg.to_dict(),
             "object_initialization": object_initialization_metadata,
+            "object_constraint": constraint_metadata,
             "iterations": list(checkpoint_iterations),
             "iteration_zero_definition": (
-                "Initialized object after coordinate resampling and before any PIE update."
+                "Initialized object after coordinate resampling and optional "
+                "constraint projection, before any PIE update."
+            ),
+            "checkpoint_state_definition": (
+                "Object after the completed iteration and constraint projection."
+                if constraints_active
+                else "Object after the completed unconstrained iteration."
+            ),
+            "checkpoint_error_definition": (
+                "SSE measured immediately before the post-iteration constraint."
+                if constraints_active
+                else "SSE from the completed unconstrained iteration."
             ),
             "error_at_iteration_zero": None,
             "objects_shape_iteration_slice_xy": list(history_arrays.shape),
@@ -1618,6 +1762,7 @@ def reconstruct_multislice_ptychography(
         "configuration": cfg.to_dict(),
         "probe_initialization": probe_initialization_metadata,
         "object_initialization": object_initialization_metadata,
+        "object_constraint": constraint_metadata,
         "reconstruction_controls": {
             **reconstruction_controls,
             "scan_position_count": scan_position_count,
@@ -2223,6 +2368,77 @@ def _normalize_object_initialization(value: str) -> str:
         allowed = ", ".join(sorted(_OBJECT_INITIALIZATION_MODES))
         raise ValueError(f"object_initialization must be one of: {allowed}.")
     return mode
+
+
+def _normalize_object_constraint(value: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError("object_constraint must be a string.")
+    mode = value.strip().lower()
+    if mode not in _OBJECT_CONSTRAINT_MODES:
+        allowed = ", ".join(sorted(_OBJECT_CONSTRAINT_MODES))
+        raise ValueError(f"object_constraint must be one of: {allowed}.")
+    return mode
+
+
+def _normalize_phase_sign(value: int) -> int:
+    if isinstance(value, (bool, np.bool_)) or int(value) != value:
+        raise ValueError("phase_sign must be either +1 or -1.")
+    sign = int(value)
+    if sign not in {-1, 1}:
+        raise ValueError("phase_sign must be either +1 or -1.")
+    return sign
+
+
+def _normalize_vacuum_guard_slices(value: tuple[int, int]) -> tuple[int, int]:
+    if isinstance(value, (str, bytes)):
+        raise TypeError(
+            "vacuum_guard_slices must contain entrance and exit slice counts."
+        )
+    try:
+        counts = tuple(value)
+    except TypeError as exc:
+        raise TypeError(
+            "vacuum_guard_slices must contain entrance and exit slice counts."
+        ) from exc
+    if len(counts) != 2:
+        raise ValueError(
+            "vacuum_guard_slices must contain exactly two slice counts."
+        )
+    normalized = []
+    for count in counts:
+        if isinstance(count, (bool, np.bool_)) or int(count) != count:
+            raise ValueError("vacuum guard counts must be non-negative integers.")
+        integer = int(count)
+        if integer < 0:
+            raise ValueError("vacuum guard counts must be non-negative integers.")
+        normalized.append(integer)
+    return normalized[0], normalized[1]
+
+
+def _apply_object_constraint_array(
+    objects: Any,
+    *,
+    mode: str,
+    phase_sign: int,
+    vacuum_guard_slices: tuple[int, int],
+) -> Any:
+    """Project complex object slices onto the requested physical constraint."""
+    from abtem.core.backend import get_array_module
+
+    xp = get_array_module(objects)
+    constrained = objects.copy()
+    if mode in {"pure_phase", "pure_phase_positive"}:
+        phase = xp.angle(constrained)
+        if mode == "pure_phase_positive":
+            phase = phase_sign * xp.maximum(phase_sign * phase, 0.0)
+        constrained = xp.exp(1j * phase).astype(objects.dtype, copy=False)
+
+    entrance, exit_ = vacuum_guard_slices
+    if entrance:
+        constrained[:entrance] = 1.0 + 0.0j
+    if exit_:
+        constrained[-exit_:] = 1.0 + 0.0j
+    return constrained
 
 
 def _normalize_capture_iterations(

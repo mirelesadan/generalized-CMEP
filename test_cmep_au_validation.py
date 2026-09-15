@@ -13,6 +13,7 @@ import numpy as np
 
 from cmep_abtem_simulation import (
     PtychographyConfig,
+    _apply_object_constraint_array,
     _derived_seeds,
     _thermal_sigmas_for_atoms,
     _validate_zarr_output_path,
@@ -80,6 +81,27 @@ class AuValidationTests(unittest.TestCase):
             repeat.metadata["model_fingerprint_sha256"],
             self.model_4nm.metadata["model_fingerprint_sha256"],
         )
+
+    def test_physical_object_constraint_projects_phase_and_guard_slices(self) -> None:
+        amplitude = np.array([0.4, 0.8, 1.2, 1.6], dtype=np.float32)
+        phase = np.array([-0.5, 0.2, 0.7, -0.9], dtype=np.float32)
+        objects = np.empty((4, 2, 2), dtype=np.complex64)
+        for index in range(4):
+            objects[index] = amplitude[index] * np.exp(1j * phase[index])
+
+        constrained = _apply_object_constraint_array(
+            objects,
+            mode="pure_phase_positive",
+            phase_sign=1,
+            vacuum_guard_slices=(1, 1),
+        )
+
+        np.testing.assert_allclose(np.abs(constrained), 1.0, atol=1e-7)
+        np.testing.assert_allclose(constrained[0], 1.0 + 0.0j, atol=1e-7)
+        np.testing.assert_allclose(constrained[-1], 1.0 + 0.0j, atol=1e-7)
+        self.assertTrue(np.all(np.angle(constrained[1:3]) >= -1e-7))
+        np.testing.assert_allclose(np.angle(constrained[1]), 0.2, atol=1e-7)
+        np.testing.assert_allclose(np.angle(constrained[2]), 0.7, atol=1e-7)
 
     def test_interactive_atomic_model_figure_has_physical_dark_scene(self) -> None:
         figure = make_atomic_model_figure(self.model_4nm)
@@ -586,6 +608,46 @@ class AuValidationTests(unittest.TestCase):
             self.assertLess(diagnostic.scale_adjusted_nrmse[0], 1e-12)
             self.assertLess(diagnostic.transmission_departure[0], 1e-12)
             self.assertTrue(diagnostic.output_path.is_file())
+            constrained = reconstruct_multislice_ptychography(
+                loaded,
+                view,
+                config,
+                Path(temp_dir) / "tiny_constrained_reconstruction.npz",
+                probe_initialization="simulation_exact",
+                object_initialization="provided_complex",
+                object_initialization_source=loaded_initializer,
+                object_constraint="pure_phase_positive",
+                phase_sign=1,
+                vacuum_guard_slices=(1, 1),
+                probe_correction_start_iteration=None,
+                position_correction=False,
+                capture_iterations=(0, 1),
+                verbose=False,
+            )
+            constrained_history = load_reconstruction_history(
+                constrained.metadata["iteration_history"]["output_path"]
+            )
+            constrained_objects = (
+                constrained_history.objects_complex_iteration_slice_xy
+            )
+            np.testing.assert_allclose(
+                np.abs(constrained_objects), 1.0, atol=2e-6
+            )
+            np.testing.assert_allclose(
+                constrained_objects[:, 0], 1.0 + 0.0j, atol=1e-7
+            )
+            np.testing.assert_allclose(
+                constrained_objects[:, -1], 1.0 + 0.0j, atol=1e-7
+            )
+            self.assertTrue(
+                constrained.metadata["object_constraint"]["active"]
+            )
+            self.assertEqual(
+                constrained.metadata["reconstruction_controls"][
+                    "vacuum_guard_slices"
+                ],
+                [1, 1],
+            )
             with self.assertRaisesRegex(ValueError, "probe_initialization"):
                 reconstruct_multislice_ptychography(
                     loaded,
