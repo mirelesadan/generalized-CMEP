@@ -25,7 +25,7 @@ from cmep_au_model import OrientedAtomsResult, atomic_model_fingerprint
 
 SIMULATION_SCHEMA = "cmep.abtem-4dstem.v3"
 ORACLE_SCHEMA = "cmep.abtem-oracle-potential.v2"
-RECONSTRUCTION_SCHEMA = "cmep.abtem-multislice-reconstruction.v3"
+RECONSTRUCTION_SCHEMA = "cmep.abtem-multislice-reconstruction.v4"
 QC_SCHEMA = "cmep.abtem-4dstem-qc.v2"
 COMPLEX_OBJECT_INITIALIZATION_SCHEMA = "cmep.abtem-complex-object-initialization.v1"
 RECONSTRUCTION_HISTORY_SCHEMA = "cmep.abtem-reconstruction-history.v1"
@@ -34,6 +34,7 @@ DEPTH_IDENTIFIABILITY_SCHEMA = "cmep.abtem-depth-identifiability.v1"
 _PROBE_INITIALIZATION_MODES = {"abtem_default", "simulation_exact"}
 _OBJECT_INITIALIZATION_MODES = {"uniform", "split_projection", "provided_complex"}
 _OBJECT_CONSTRAINT_MODES = {"none", "pure_phase", "pure_phase_positive"}
+_RECONSTRUCTION_GRID_MODES = {"detector", "simulation_native"}
 
 _WINDOWS_LEGACY_PATH_LIMIT = 260
 # Zarr 3 appends nested array/chunk keys and a 32-character atomic-write token.
@@ -1331,6 +1332,9 @@ def reconstruct_multislice_ptychography(
     object_constraint: str = "none",
     phase_sign: int = 1,
     vacuum_guard_slices: tuple[int, int] = (0, 0),
+    reconstruction_grid: str = "simulation_native",
+    object_antialiasing: bool = True,
+    final_slice_propagation: bool = True,
     capture_iterations: tuple[int, ...] | list[int] | None = None,
     overwrite: bool = False,
     verbose: bool = True,
@@ -1350,13 +1354,19 @@ def reconstruct_multislice_ptychography(
     one run; iteration 0 is the initialized object before any PIE update. Step
     sizes and damping are forwarded to abTEM's iterative operator. Optional
     object constraints are applied after initialization and after every complete
-    MS-PIE iteration. ``pure_phase`` forces unit amplitude, while
+    MS-PIE iteration. ``reconstruction_grid='simulation_native'`` center-pads
+    cropped diffraction patterns so the object retains the simulation potential's
+    real-space sampling. ``object_antialiasing=True`` applies abTEM's transmission
+    antialias aperture after initialization and each iteration. ``pure_phase``
+    forces unit amplitude before that bandlimit, while
     ``pure_phase_positive`` additionally retains only the phase polarity selected
     by ``phase_sign``. ``vacuum_guard_slices=(entrance, exit)`` freezes terminal
-    depth slices to vacuum transmission. Probe correction can start after a whole
-    number of scan iterations; ``None`` disables it. Position correction is
-    disabled by default for exact simulated scan coordinates and is not currently
-    combined with iteration-level object constraints.
+    depth slices to vacuum transmission. ``final_slice_propagation=True`` matches
+    conventional abTEM multislice at the detector plane and applies its adjoint
+    before PIE updates. Probe correction can start after a whole number of scan
+    iterations; ``None`` disables it. Position correction is disabled by default
+    for exact simulated scan coordinates and is not currently combined with
+    iteration-level object projections.
     """
     cfg = config.validated()
     sim = (
@@ -1412,21 +1422,44 @@ def reconstruct_multislice_ptychography(
         probe_start_iteration = None
     if not isinstance(position_correction, (bool, np.bool_)):
         raise TypeError("position_correction must be Boolean.")
+    grid_mode = _normalize_reconstruction_grid(reconstruction_grid)
+    if not isinstance(object_antialiasing, (bool, np.bool_)):
+        raise TypeError("object_antialiasing must be Boolean.")
+    if not isinstance(final_slice_propagation, (bool, np.bool_)):
+        raise TypeError("final_slice_propagation must be Boolean.")
+    use_object_antialiasing = bool(object_antialiasing)
+    use_final_slice_propagation = bool(final_slice_propagation)
     constraint_mode = _normalize_object_constraint(object_constraint)
     normalized_phase_sign = _normalize_phase_sign(phase_sign)
     normalized_vacuum_guards = _normalize_vacuum_guard_slices(
         vacuum_guard_slices
     )
-    constraints_active = (
-        constraint_mode != "none" or normalized_vacuum_guards != (0, 0)
+    projections_active = (
+        constraint_mode != "none"
+        or normalized_vacuum_guards != (0, 0)
+        or use_object_antialiasing
     )
-    if constraints_active and position_correction:
+    if projections_active and position_correction:
         raise ValueError(
             "position_correction is not supported with iteration-level object "
-            "constraints. Disable position correction for constrained runs."
+            "projections. Disable position correction for projected runs."
         )
     checkpoint_iterations = _normalize_capture_iterations(
         capture_iterations, cfg.reconstruction_iterations
+    )
+
+    detector_shape = tuple(
+        int(value) for value in sim.diffraction_patterns.shape[-2:]
+    )
+    grid_metadata = _reconstruction_grid_metadata(
+        view,
+        cfg,
+        detector_shape=detector_shape,
+        mode=grid_mode,
+        simulation_metadata=sim.metadata,
+    )
+    region_of_interest_shape = tuple(
+        int(value) for value in grid_metadata["region_of_interest_gpts_xy"]
     )
 
     base_reconstruction_controls = {
@@ -1437,31 +1470,30 @@ def reconstruct_multislice_ptychography(
         "step_size_damping_rate": damping_rate,
         "probe_correction_start_iteration": probe_start_iteration,
         "position_correction": bool(position_correction),
+        "reconstruction_grid": grid_mode,
+        "region_of_interest_gpts_xy": list(region_of_interest_shape),
+        "object_antialiasing": use_object_antialiasing,
+        "final_slice_propagation": use_final_slice_propagation,
     }
     reconstruction_controls = {
         **base_reconstruction_controls,
         "object_initialization": object_mode,
         "object_descriptor_fingerprint_sha256": object_descriptor_fingerprint,
     }
-    if constraints_active:
+    if projections_active:
         reconstruction_controls["object_constraint"] = constraint_mode
         reconstruction_controls["phase_sign"] = normalized_phase_sign
         reconstruction_controls["vacuum_guard_slices"] = list(
             normalized_vacuum_guards
         )
-        reconstruction_controls["constraint_application"] = (
+        reconstruction_controls["object_projection_application"] = (
             "after initialization and after every completed MS-PIE iteration"
         )
     if checkpoint_iterations:
         reconstruction_controls["capture_iterations"] = list(
             checkpoint_iterations
         )
-    # Preserve cache compatibility for the historical deterministic initializer.
-    fingerprint_controls = (
-        base_reconstruction_controls
-        if object_mode == "uniform" and not constraints_active
-        else reconstruction_controls
-    )
+    fingerprint_controls = reconstruction_controls
     path = _require_suffix(output_path, ".npz")
     path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path = path.with_suffix(".json")
@@ -1519,10 +1551,32 @@ def reconstruct_multislice_ptychography(
         energy=cfg.energy_ev,
         num_slices=num_slices,
         slice_thicknesses=slice_thickness,
+        region_of_interest_shape=region_of_interest_shape,
         semiangle_cutoff=cfg.semiangle_mrad,
         preprocess=True,
         device=str(cfg.device).strip().lower(),
     )
+    if grid_mode == "simulation_native" and not np.allclose(
+        np.asarray(operator.sampling, dtype=np.float64),
+        np.asarray(
+            grid_metadata["requested_effective_sampling_xy_angstrom"],
+            dtype=np.float64,
+        ),
+        rtol=0.0,
+        atol=1e-8,
+    ):
+        raise RuntimeError(
+            "The padded MS-PIE grid did not recover the requested "
+            "reconstruction "
+            f"sampling: {operator.sampling} versus "
+            f"{grid_metadata['requested_effective_sampling_xy_angstrom']}."
+        )
+    if verbose:
+        print(
+            "MS-PIE grid: "
+            f"detector={detector_shape}, ROI={region_of_interest_shape}, "
+            f"sampling={tuple(float(value) for value in operator.sampling)} A"
+        )
     probe_initialization_metadata = _initialize_reconstruction_probe(
         operator,
         probe_descriptor,
@@ -1537,26 +1591,33 @@ def reconstruct_multislice_ptychography(
             0.0, cell_z, num_slices + 1, dtype=np.float64
         ),
         descriptor_fingerprint=object_descriptor_fingerprint,
+        antialias=use_object_antialiasing,
     )
     constraint_metadata = {
-        "active": constraints_active,
+        "active": projections_active,
         "mode": constraint_mode,
         "phase_sign": normalized_phase_sign,
+        "object_antialiasing": use_object_antialiasing,
         "vacuum_guard_slices": list(normalized_vacuum_guards),
         "application": (
             "after initialization and after every completed MS-PIE iteration"
-            if constraints_active
+            if projections_active
             else None
         ),
         "guard_value": "1+0j vacuum transmission",
         "phase_representation": "wrapped angle in [-pi, pi]",
     }
-    if constraints_active:
+    if projections_active:
         operator._objects = _apply_object_constraint_array(
             operator._objects,
             mode=constraint_mode,
             phase_sign=normalized_phase_sign,
             vacuum_guard_slices=normalized_vacuum_guards,
+            antialias_sampling=(
+                tuple(float(value) for value in operator.sampling)
+                if use_object_antialiasing
+                else None
+            ),
         )
 
     initial_object_array: np.ndarray | None = None
@@ -1568,7 +1629,7 @@ def reconstruct_multislice_ptychography(
         ).copy()
     constrained_checkpoints: dict[int, np.ndarray] = {}
     constrained_checkpoint_errors: dict[int, float] = {}
-    if constraints_active:
+    if projections_active:
         from abtem.core.backend import asnumpy
 
         if initial_object_array is not None:
@@ -1576,7 +1637,7 @@ def reconstruct_multislice_ptychography(
             constrained_checkpoint_errors[0] = np.nan
         if verbose:
             print(
-                "Constrained ptychographic reconstruction will perform "
+                "Projected ptychographic reconstruction will perform "
                 f"{cfg.reconstruction_iterations} MS-PIE iterations."
             )
         iteration_width = len(str(cfg.reconstruction_iterations))
@@ -1589,11 +1650,21 @@ def reconstruct_multislice_ptychography(
                 epoch_pre_probe_correction_steps = scan_position_count + 1
             else:
                 epoch_pre_probe_correction_steps = None
+            epoch_functions_queue = _multislice_functions_queue(
+                operator,
+                max_iterations=1,
+                pre_probe_correction_update_steps=(
+                    epoch_pre_probe_correction_steps
+                ),
+                pre_position_correction_update_steps=None,
+                final_slice_propagation=use_final_slice_propagation,
+            )
             _, _, _, epoch_error = operator.reconstruct(
                 max_iterations=1,
                 return_iterations=False,
                 random_seed=(cfg.random_seed if iteration_index == 0 else None),
                 verbose=False,
+                functions_queue=epoch_functions_queue,
                 parameters={
                     "object_step_size": (
                         object_step * damping_rate**iteration_index
@@ -1612,6 +1683,11 @@ def reconstruct_multislice_ptychography(
                 mode=constraint_mode,
                 phase_sign=normalized_phase_sign,
                 vacuum_guard_slices=normalized_vacuum_guards,
+                antialias_sampling=(
+                    tuple(float(value) for value in operator.sampling)
+                    if use_object_antialiasing
+                    else None
+                ),
             )
             completed_iteration = iteration_index + 1
             if completed_iteration in checkpoint_iterations:
@@ -1621,7 +1697,7 @@ def reconstruct_multislice_ptychography(
                 constrained_checkpoint_errors[completed_iteration] = error
             if verbose:
                 print(
-                    f"----Constrained iteration {iteration_index:<{iteration_width}}, "
+                    f"----Projected iteration {iteration_index:<{iteration_width}}, "
                     f"SSE = {error:.3e}"
                 )
 
@@ -1634,11 +1710,19 @@ def reconstruct_multislice_ptychography(
         ) * np.asarray(operator.sampling, dtype=np.float64)
         sampling = tuple(float(value) for value in operator.sampling)
     else:
+        functions_queue = _multislice_functions_queue(
+            operator,
+            max_iterations=cfg.reconstruction_iterations,
+            pre_probe_correction_update_steps=pre_probe_correction_update_steps,
+            pre_position_correction_update_steps=pre_position_correction_update_steps,
+            final_slice_propagation=use_final_slice_propagation,
+        )
         reconstruction_output = operator.reconstruct(
             max_iterations=cfg.reconstruction_iterations,
             return_iterations=bool(checkpoint_iterations),
             random_seed=cfg.random_seed,
             verbose=verbose,
+            functions_queue=functions_queue,
             parameters={
                 "object_step_size": object_step,
                 "probe_step_size": probe_step,
@@ -1685,7 +1769,7 @@ def reconstruct_multislice_ptychography(
         selected_objects = []
         selected_errors = []
         for iteration in checkpoint_iterations:
-            if constraints_active:
+            if projections_active:
                 selected_objects.append(constrained_checkpoints[iteration])
                 selected_errors.append(constrained_checkpoint_errors[iteration])
             elif iteration == 0:
@@ -1726,12 +1810,12 @@ def reconstruct_multislice_ptychography(
             ),
             "checkpoint_state_definition": (
                 "Object after the completed iteration and constraint projection."
-                if constraints_active
+                if projections_active
                 else "Object after the completed unconstrained iteration."
             ),
             "checkpoint_error_definition": (
                 "SSE measured immediately before the post-iteration constraint."
-                if constraints_active
+                if projections_active
                 else "SSE from the completed unconstrained iteration."
             ),
             "error_at_iteration_zero": None,
@@ -1760,6 +1844,14 @@ def reconstruct_multislice_ptychography(
         "simulation_fingerprint_sha256": sim.metadata["fingerprint_sha256"],
         "view": view.metadata,
         "configuration": cfg.to_dict(),
+        "reconstruction_grid": {
+            **grid_metadata,
+            "effective_sampling_xy_angstrom": list(sampling),
+            "padded_detector_pixels_xy": [
+                int(region_of_interest_shape[index] - detector_shape[index])
+                for index in range(2)
+            ],
+        },
         "probe_initialization": probe_initialization_metadata,
         "object_initialization": object_initialization_metadata,
         "object_constraint": constraint_metadata,
@@ -2319,6 +2411,116 @@ def _ensure_abtem_reconstruction_compatibility() -> bool:
     return True
 
 
+def _multislice_overlap_projection_with_final_propagation(
+    objects: Any,
+    probes: Any,
+    position: Any,
+    old_position: Any,
+    **kwargs: Any,
+) -> tuple[Any, Any]:
+    """Run MS-PIE overlap and propagate the final slice to the detector plane."""
+    from abtem.reconstruct import (
+        MultislicePtychographicOperator,
+        _propagate_array,
+    )
+
+    probes, exit_waves = MultislicePtychographicOperator._overlap_projection(
+        objects,
+        probes,
+        position,
+        old_position,
+        **kwargs,
+    )
+    slice_thicknesses = np.asarray(kwargs["slice_thicknesses"], dtype=np.float64)
+    exit_waves[-1] = _propagate_array(
+        kwargs["propagator"],
+        exit_waves[-1],
+        sampling=kwargs["sampling"],
+        wavelength=kwargs["wavelength"],
+        thickness=float(slice_thicknesses[-1]),
+        overwrite=False,
+        xp=kwargs.get("xp", np),
+    )
+    return probes, exit_waves
+
+
+def _multislice_update_with_final_propagation(
+    objects: Any,
+    probes: Any,
+    position: Any,
+    exit_waves: Any,
+    modified_exit_waves: Any,
+    diffraction_patterns: Any,
+    **kwargs: Any,
+) -> tuple[Any, Any, Any]:
+    """Apply the final propagator adjoint before the standard MS-PIE update."""
+    from abtem.reconstruct import (
+        MultislicePtychographicOperator,
+        _propagate_array,
+    )
+
+    slice_thicknesses = np.asarray(kwargs["slice_thicknesses"], dtype=np.float64)
+    object_plane_exit_waves = exit_waves.copy()
+    object_plane_modified_waves = modified_exit_waves.copy()
+    propagation_kwargs = {
+        "sampling": kwargs["sampling"],
+        "wavelength": kwargs["wavelength"],
+        "thickness": -float(slice_thicknesses[-1]),
+        "overwrite": False,
+        "xp": kwargs.get("xp", np),
+    }
+    object_plane_exit_waves[-1] = _propagate_array(
+        kwargs["propagator"], exit_waves[-1], **propagation_kwargs
+    )
+    object_plane_modified_waves[-1] = _propagate_array(
+        kwargs["propagator"], modified_exit_waves[-1], **propagation_kwargs
+    )
+    return MultislicePtychographicOperator._update_function(
+        objects,
+        probes,
+        position,
+        object_plane_exit_waves,
+        object_plane_modified_waves,
+        diffraction_patterns,
+        **kwargs,
+    )
+
+
+def _multislice_functions_queue(
+    operator: Any,
+    *,
+    max_iterations: int,
+    pre_probe_correction_update_steps: int | None,
+    pre_position_correction_update_steps: int | None,
+    final_slice_propagation: bool,
+) -> Any:
+    """Prepare abTEM's queue, optionally replacing the final-plane operators."""
+    if not final_slice_propagation:
+        return None
+    queue, _ = operator._prepare_functions_queue(
+        max_iterations,
+        pre_probe_correction_update_steps=pre_probe_correction_update_steps,
+        pre_position_correction_update_steps=pre_position_correction_update_steps,
+    )
+    return [
+        [
+            (
+                _multislice_overlap_projection_with_final_propagation,
+                fourier_projection,
+                _multislice_update_with_final_propagation,
+                position_correction,
+            )
+            for (
+                _overlap_projection,
+                fourier_projection,
+                _update_function,
+                position_correction,
+            ) in iteration
+        ]
+        for iteration in queue
+    ]
+
+
 def _make_potential(
     view: OrientedAtomsResult,
     config: PtychographyConfig,
@@ -2380,6 +2582,70 @@ def _normalize_object_constraint(value: str) -> str:
     return mode
 
 
+def _normalize_reconstruction_grid(value: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError("reconstruction_grid must be a string.")
+    mode = value.strip().lower()
+    if mode not in _RECONSTRUCTION_GRID_MODES:
+        allowed = ", ".join(sorted(_RECONSTRUCTION_GRID_MODES))
+        raise ValueError(f"reconstruction_grid must be one of: {allowed}.")
+    return mode
+
+
+def _reconstruction_grid_metadata(
+    view: OrientedAtomsResult,
+    config: PtychographyConfig,
+    *,
+    detector_shape: tuple[int, int],
+    mode: str,
+    simulation_metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Describe the detector padding needed to retain simulation sampling."""
+    cell_xy = np.asarray(view.atoms.cell.lengths()[:2], dtype=np.float64)
+    requested_sampling = float(config.potential_sampling_angstrom)
+    simulation_config = simulation_metadata.get("configuration")
+    if isinstance(simulation_config, Mapping):
+        simulated_sampling = simulation_config.get("potential_sampling_angstrom")
+        if simulated_sampling is not None and not np.isclose(
+            float(simulated_sampling), requested_sampling, rtol=0.0, atol=1e-12
+        ):
+            raise ValueError(
+                "Reconstruction potential_sampling_angstrom must match the cached "
+                f"simulation: {requested_sampling} != {simulated_sampling}."
+            )
+
+    native_gpts = tuple(
+        int(value) for value in np.ceil(cell_xy / requested_sampling).astype(int)
+    )
+    detector_gpts = tuple(int(value) for value in detector_shape)
+    if mode == "simulation_native":
+        # Center-pad cropped detectors to the native potential grid, but retain
+        # a detector that already samples more finely than that grid.
+        roi_gpts = tuple(
+            max(detector, native)
+            for detector, native in zip(detector_gpts, native_gpts)
+        )
+    else:
+        roi_gpts = detector_gpts
+
+    effective_sampling = cell_xy / np.asarray(roi_gpts, dtype=np.float64)
+
+    return {
+        "mode": mode,
+        "detector_gpts_xy": list(detector_gpts),
+        "simulation_native_gpts_xy": list(native_gpts),
+        "region_of_interest_gpts_xy": list(roi_gpts),
+        "simulation_cell_xy_angstrom": cell_xy.tolist(),
+        "requested_potential_sampling_angstrom": requested_sampling,
+        "simulation_native_sampling_xy_angstrom": (
+            cell_xy / np.asarray(native_gpts, dtype=np.float64)
+        ).tolist(),
+        "requested_effective_sampling_xy_angstrom": effective_sampling.tolist(),
+        "native_sampling_recovered_exactly": roi_gpts == native_gpts,
+        "detector_patterns_center_padded": roi_gpts != detector_gpts,
+    }
+
+
 def _normalize_phase_sign(value: int) -> int:
     if isinstance(value, (bool, np.bool_)) or int(value) != value:
         raise ValueError("phase_sign must be either +1 or -1.")
@@ -2421,8 +2687,9 @@ def _apply_object_constraint_array(
     mode: str,
     phase_sign: int,
     vacuum_guard_slices: tuple[int, int],
+    antialias_sampling: tuple[float, float] | None = None,
 ) -> Any:
-    """Project complex object slices onto the requested physical constraint."""
+    """Project complex object slices onto physical phase and bandwidth constraints."""
     from abtem.core.backend import get_array_module
 
     xp = get_array_module(objects)
@@ -2438,7 +2705,43 @@ def _apply_object_constraint_array(
         constrained[:entrance] = 1.0 + 0.0j
     if exit_:
         constrained[-exit_:] = 1.0 + 0.0j
+    if antialias_sampling is not None:
+        constrained = _bandlimit_object_array(
+            constrained, sampling=antialias_sampling
+        )
+        if entrance:
+            constrained[:entrance] = 1.0 + 0.0j
+        if exit_:
+            constrained[-exit_:] = 1.0 + 0.0j
     return constrained
+
+
+def _bandlimit_object_array(
+    objects: Any,
+    *,
+    sampling: tuple[float, float],
+) -> Any:
+    """Apply the same lateral antialias aperture used for abTEM transmission."""
+    from abtem.antialias import antialias_aperture
+    from abtem.core.backend import get_array_module
+    from abtem.core.fft import fft2_convolve
+
+    if len(objects.shape) < 2:
+        raise ValueError("objects must have at least two lateral dimensions.")
+    normalized_sampling = tuple(float(value) for value in sampling)
+    if len(normalized_sampling) != 2 or any(
+        not np.isfinite(value) or value <= 0.0
+        for value in normalized_sampling
+    ):
+        raise ValueError("sampling must contain two positive finite values.")
+    xp = get_array_module(objects)
+    kernel = antialias_aperture(
+        tuple(int(value) for value in objects.shape[-2:]),
+        normalized_sampling,
+        xp,
+    )
+    bandlimited = fft2_convolve(objects, kernel, overwrite_x=False)
+    return bandlimited.astype(objects.dtype, copy=False)
 
 
 def _normalize_capture_iterations(
@@ -2909,6 +3212,7 @@ def _initialize_reconstruction_object(
     *,
     target_z_edges_angstrom: np.ndarray,
     descriptor_fingerprint: str,
+    antialias: bool,
 ) -> dict[str, Any]:
     """Install a validated object guess after abTEM establishes its grid."""
     from abtem.core.backend import asnumpy, copy_to_device
@@ -3012,6 +3316,39 @@ def _initialize_reconstruction_object(
         product_relative_max_error = None
         source_path = None
 
+    pre_antialias_objects = initial_objects
+    if antialias:
+        operator._objects = _bandlimit_object_array(
+            operator._objects,
+            sampling=tuple(float(value) for value in target_sampling),
+        )
+        initial_objects = np.asarray(
+            asnumpy(operator._objects), dtype=np.complex64
+        )
+    amplitude_deviation = np.abs(initial_objects) - 1.0
+    antialias_metadata = {
+        "applied": bool(antialias),
+        "method": (
+            "abTEM two-thirds lateral antialias aperture"
+            if antialias
+            else None
+        ),
+        "relative_complex_change": (
+            float(
+                np.linalg.norm(initial_objects - pre_antialias_objects)
+                / max(
+                    float(np.linalg.norm(pre_antialias_objects)),
+                    np.finfo(np.float64).eps,
+                )
+            )
+            if antialias
+            else 0.0
+        ),
+        "rms_amplitude_deviation_from_one": float(
+            np.sqrt(np.mean(amplitude_deviation.astype(np.float64) ** 2))
+        ),
+    }
+
     return {
         **dict(descriptor),
         "descriptor_fingerprint_sha256": descriptor_fingerprint,
@@ -3024,6 +3361,7 @@ def _initialize_reconstruction_object(
         "initial_complex_array_sha256": _sha256_array(initial_objects),
         "recombined_source_relative_max_error": product_relative_max_error,
         "coordinate_resampling": interpolation_metadata,
+        "transmission_antialiasing": antialias_metadata,
     }
 
 

@@ -14,6 +14,7 @@ import numpy as np
 from cmep_abtem_simulation import (
     PtychographyConfig,
     _apply_object_constraint_array,
+    _bandlimit_object_array,
     _derived_seeds,
     _thermal_sigmas_for_atoms,
     _validate_zarr_output_path,
@@ -102,6 +103,29 @@ class AuValidationTests(unittest.TestCase):
         self.assertTrue(np.all(np.angle(constrained[1:3]) >= -1e-7))
         np.testing.assert_allclose(np.angle(constrained[1]), 0.2, atol=1e-7)
         np.testing.assert_allclose(np.angle(constrained[2]), 0.7, atol=1e-7)
+
+    def test_object_antialiasing_preserves_constant_and_removes_checkerboard(self) -> None:
+        constant = np.ones((2, 12, 10), dtype=np.complex64)
+        np.testing.assert_allclose(
+            _bandlimit_object_array(constant, sampling=(0.2, 0.2)),
+            constant,
+            atol=1e-7,
+        )
+
+        checkerboard = np.where(
+            np.indices((12, 10)).sum(axis=0) % 2,
+            -1.0,
+            1.0,
+        ).astype(np.complex64)[None]
+        bandlimited = _bandlimit_object_array(
+            checkerboard, sampling=(0.2, 0.2)
+        )
+        self.assertEqual(bandlimited.shape, checkerboard.shape)
+        self.assertEqual(bandlimited.dtype, checkerboard.dtype)
+        self.assertLess(
+            float(np.linalg.norm(bandlimited)),
+            float(np.linalg.norm(checkerboard)) * 1e-4,
+        )
 
     def test_interactive_atomic_model_figure_has_physical_dark_scene(self) -> None:
         figure = make_atomic_model_figure(self.model_4nm)
@@ -547,6 +571,29 @@ class AuValidationTests(unittest.TestCase):
             self.assertIsNone(controls["probe_correction_start_iteration"])
             self.assertFalse(controls["position_correction"])
             self.assertEqual(
+                controls["reconstruction_grid"], "simulation_native"
+            )
+            self.assertTrue(controls["object_antialiasing"])
+            self.assertTrue(controls["final_slice_propagation"])
+            grid_metadata = reconstruction.metadata["reconstruction_grid"]
+            self.assertEqual(grid_metadata["mode"], "simulation_native")
+            self.assertEqual(
+                grid_metadata["region_of_interest_gpts_xy"],
+                [
+                    max(detector, native)
+                    for detector, native in zip(
+                        grid_metadata["detector_gpts_xy"],
+                        grid_metadata["simulation_native_gpts_xy"],
+                    )
+                ],
+            )
+            np.testing.assert_allclose(
+                grid_metadata["effective_sampling_xy_angstrom"],
+                grid_metadata["requested_effective_sampling_xy_angstrom"],
+                atol=1e-8,
+                rtol=0.0,
+            )
+            self.assertEqual(
                 controls["abtem_pre_probe_correction_update_steps"],
                 controls["total_update_steps"] + 1,
             )
@@ -619,6 +666,7 @@ class AuValidationTests(unittest.TestCase):
                 object_constraint="pure_phase_positive",
                 phase_sign=1,
                 vacuum_guard_slices=(1, 1),
+                object_antialiasing=False,
                 probe_correction_start_iteration=None,
                 position_correction=False,
                 capture_iterations=(0, 1),
