@@ -1408,7 +1408,9 @@ def reconstruct_multislice_ptychography(
     probe encoded by the simulation manifest on the reconstruction grid before
     the first PIE update. ``object_initialization='split_projection'`` requires
     a compatible one-slice reconstruction and distributes its complex
-    transmission evenly across the requested target slices.
+    transmission evenly across the requested target slices. When vacuum guards
+    are requested, only the unguarded slices participate in that split so their
+    product still reproduces the one-slice transmission.
     ``object_initialization='provided_complex'`` accepts physically described
     complex slices and linearly resamples only their in-plane coordinates onto
     the reconstruction grid. ``capture_iterations`` stores selected states from
@@ -1653,6 +1655,7 @@ def reconstruct_multislice_ptychography(
         ),
         descriptor_fingerprint=object_descriptor_fingerprint,
         antialias=use_object_antialiasing,
+        vacuum_guard_slices=normalized_vacuum_guards,
     )
     constraint_metadata = {
         "active": projections_active,
@@ -3027,8 +3030,8 @@ def _reconstruction_object_descriptor(
             "source_object_origin_xy_angstrom": source_origin.tolist(),
             "source_complex_array_sha256": _sha256_array(objects),
             "split_rule": (
-                "principal complex Nth root: abs(object)**(1/N) * "
-                "exp(1j*angle(object)/N)"
+                "principal complex Nth root over active unguarded target slices; "
+                "guarded slices remain 1+0j vacuum transmission"
             ),
         }
         return result, descriptor
@@ -3265,6 +3268,58 @@ def _initialize_reconstruction_probe(
     }
 
 
+def _split_projection_across_active_slices(
+    source_projection: np.ndarray,
+    num_slices: int,
+    *,
+    vacuum_guard_slices: tuple[int, int],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Split one complex projection over only the reconstructable depth slabs."""
+    projection = np.asarray(source_projection, dtype=np.complex64)
+    if projection.ndim != 2:
+        raise ValueError("source_projection must be a two-dimensional array.")
+    if not np.isfinite(projection.real).all() or not np.isfinite(
+        projection.imag
+    ).all():
+        raise ValueError("source_projection contains non-finite values.")
+    if isinstance(num_slices, (bool, np.bool_)) or int(num_slices) != num_slices:
+        raise TypeError("num_slices must be a positive integer.")
+    total_slices = int(num_slices)
+    if total_slices < 1:
+        raise ValueError("num_slices must be a positive integer.")
+
+    guard_in, guard_out = _normalize_vacuum_guard_slices(vacuum_guard_slices)
+    active_start = guard_in
+    active_stop = total_slices - guard_out
+    active_count = active_stop - active_start
+    if active_count < 1:
+        raise ValueError(
+            "vacuum_guard_slices must leave at least one active depth slice."
+        )
+
+    amplitude_root = np.power(
+        np.abs(projection).astype(np.float64), 1.0 / active_count
+    )
+    phase_root = np.angle(projection).astype(np.float64) / active_count
+    active_slice = amplitude_root * np.exp(1j * phase_root)
+    objects = np.ones(
+        (total_slices, *projection.shape), dtype=np.complex64
+    )
+    objects[active_start:active_stop] = active_slice.astype(np.complex64)
+
+    return objects, {
+        "rule": (
+            "principal complex root distributed uniformly over active unguarded "
+            "slices; guarded slices are 1+0j vacuum transmission"
+        ),
+        "total_slice_count": total_slices,
+        "vacuum_guard_slices": [guard_in, guard_out],
+        "active_slice_count": active_count,
+        "active_slice_range_stop_exclusive": [active_start, active_stop],
+        "principal_root_degree": active_count,
+    }
+
+
 def _initialize_reconstruction_object(
     operator: Any,
     simulation: SimulationResult,
@@ -3274,6 +3329,7 @@ def _initialize_reconstruction_object(
     target_z_edges_angstrom: np.ndarray,
     descriptor_fingerprint: str,
     antialias: bool,
+    vacuum_guard_slices: tuple[int, int],
 ) -> dict[str, Any]:
     """Install a validated object guess after abTEM establishes its grid."""
     from abtem.core.backend import asnumpy, copy_to_device
@@ -3292,6 +3348,7 @@ def _initialize_reconstruction_object(
     target_z_edges = np.asarray(target_z_edges_angstrom, dtype=np.float64)
     mode = str(descriptor["mode"])
     interpolation_metadata: dict[str, Any] | None = None
+    split_distribution_metadata: dict[str, Any] | None = None
 
     if mode == "split_projection":
         if source is None:
@@ -3322,15 +3379,13 @@ def _initialize_reconstruction_object(
                 f"{source_origin.tolist()} != {target_origin.tolist()}."
             )
 
-        num_slices = target_shape[0]
-        amplitude_root = np.power(
-            np.abs(source_projection).astype(np.float64), 1.0 / num_slices
+        initial_objects, split_distribution_metadata = (
+            _split_projection_across_active_slices(
+                source_projection,
+                target_shape[0],
+                vacuum_guard_slices=vacuum_guard_slices,
+            )
         )
-        phase_root = np.angle(source_projection).astype(np.float64) / num_slices
-        initial_slice = amplitude_root * np.exp(1j * phase_root)
-        initial_objects = np.repeat(
-            initial_slice[np.newaxis, :, :], num_slices, axis=0
-        ).astype(np.complex64)
         operator._objects = copy_to_device(initial_objects, operator._device)
 
         recombined = np.prod(initial_objects.astype(np.complex128), axis=0)
@@ -3421,6 +3476,7 @@ def _initialize_reconstruction_object(
         "initial_complex_array_dtype": str(initial_objects.dtype),
         "initial_complex_array_sha256": _sha256_array(initial_objects),
         "recombined_source_relative_max_error": product_relative_max_error,
+        "split_projection_distribution": split_distribution_metadata,
         "coordinate_resampling": interpolation_metadata,
         "transmission_antialiasing": antialias_metadata,
     }
