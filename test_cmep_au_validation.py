@@ -29,6 +29,8 @@ from cmep_abtem_simulation import (
     oracle_potential_to_complex_object,
     plot_4dstem_quality,
     reconstruct_multislice_ptychography,
+    simulation_configuration,
+    simulation_configuration_differences,
     simulate_4dstem,
 )
 from cmep_au_model import (
@@ -349,6 +351,43 @@ class AuValidationTests(unittest.TestCase):
         self.assertEqual(seeds_a, _derived_seeds(17, namespace=namespace_a))
         self.assertNotEqual(seeds_a, _derived_seeds(17, namespace=namespace_b))
         self.assertEqual(len(set(seeds_a.values())), len(seeds_a))
+
+    def test_simulation_cache_ignores_reconstruction_and_runtime_controls(self) -> None:
+        cached = PtychographyConfig(
+            condition_name="ideal_static",
+            device="gpu",
+            frozen_phonon_configs=1,
+            dose_electrons_per_angstrom2=None,
+            reconstruction_slice_thickness_angstrom=2.0,
+            reconstruction_iterations=20,
+        )
+        requested = replace(
+            cached,
+            device="cpu",
+            max_batch=3,
+            cpu_chunk_size="64 MB",
+            gpu_chunk_size="256 MB",
+            reconstruction_slice_thickness_angstrom=1.0,
+            reconstruction_iterations=2,
+        )
+        self.assertEqual(
+            simulation_configuration(cached),
+            simulation_configuration(requested),
+        )
+        self.assertEqual(
+            simulation_configuration_differences(cached, requested), {}
+        )
+
+        physically_different = replace(requested, detector_max_angle_mrad=60.0)
+        self.assertEqual(
+            simulation_configuration_differences(cached, physically_different),
+            {
+                "detector_max_angle_mrad": {
+                    "cached": 50.0,
+                    "requested": 60.0,
+                }
+            },
+        )
 
     def test_resource_estimate_scales_without_a_cap(self) -> None:
         frame = make_view_frame("plan", [0, 0, 1], [0, 1, 0])

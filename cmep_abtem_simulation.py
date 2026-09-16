@@ -35,6 +35,14 @@ _PROBE_INITIALIZATION_MODES = {"abtem_default", "simulation_exact"}
 _OBJECT_INITIALIZATION_MODES = {"uniform", "split_projection", "provided_complex"}
 _OBJECT_CONSTRAINT_MODES = {"none", "pure_phase", "pure_phase_positive"}
 _RECONSTRUCTION_GRID_MODES = {"detector", "simulation_native"}
+_NON_SIMULATION_CONFIG_FIELDS = {
+    "device",
+    "max_batch",
+    "cpu_chunk_size",
+    "gpu_chunk_size",
+    "reconstruction_slice_thickness_angstrom",
+    "reconstruction_iterations",
+}
 
 _WINDOWS_LEGACY_PATH_LIMIT = 260
 # Zarr 3 appends nested array/chunk keys and a 32-character atomic-write token.
@@ -207,6 +215,44 @@ class PtychographyConfig:
                 for key, value in sorted(self.probe_aberrations.items())
             }
         return data
+
+
+def simulation_configuration(
+    value: PtychographyConfig | Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return only settings that can change simulated diffraction data."""
+    if isinstance(value, PtychographyConfig):
+        data = value.validated().to_dict()
+    elif isinstance(value, Mapping):
+        data = dict(value)
+    else:
+        raise TypeError(
+            "value must be a PtychographyConfig or configuration mapping."
+        )
+    return {
+        key: data[key]
+        for key in sorted(data)
+        if key not in _NON_SIMULATION_CONFIG_FIELDS
+    }
+
+
+def simulation_configuration_differences(
+    cached: PtychographyConfig | Mapping[str, Any],
+    requested: PtychographyConfig | Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Report physical settings that prevent reuse of a 4D-STEM cache."""
+    cached_data = simulation_configuration(cached)
+    requested_data = simulation_configuration(requested)
+    differences: dict[str, dict[str, Any]] = {}
+    for key in sorted(set(cached_data) | set(requested_data)):
+        cached_value = cached_data.get(key, "<missing>")
+        requested_value = requested_data.get(key, "<missing>")
+        if cached_value != requested_value:
+            differences[key] = {
+                "cached": cached_value,
+                "requested": requested_value,
+            }
+    return differences
 
 
 def make_validation_conditions(
@@ -868,12 +914,26 @@ def simulate_4dstem(
     path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path = path.with_suffix(".json")
     model_hash = model_fingerprint or atomic_model_fingerprint(view.atoms)
+    simulation_config = simulation_configuration(cfg)
+    if path.exists() and manifest_path.is_file() and not overwrite:
+        cached = load_4dstem(path)
+        cached_config = cached.metadata.get(
+            "simulation_configuration",
+            cached.metadata.get("configuration", {}),
+        )
+        cache_is_compatible = (
+            not simulation_configuration_differences(cached_config, cfg)
+            and cached.metadata.get("view") == view.metadata
+            and cached.metadata.get("model_fingerprint_sha256") == model_hash
+        )
+        if cache_is_compatible:
+            return cached
     fingerprint = _fingerprint(
         {
             "schema": SIMULATION_SCHEMA,
             "model_fingerprint": model_hash,
             "view": view.metadata,
-            "configuration": cfg.to_dict(),
+            "simulation_configuration": simulation_config,
         }
     )
     if _cache_matches(
@@ -941,6 +1001,7 @@ def simulate_4dstem(
         "model_fingerprint_sha256": model_hash,
         "view": view.metadata,
         "configuration": cfg.to_dict(),
+        "simulation_configuration": simulation_config,
         "condition": {
             "name": cfg.condition_name,
             "description": VALIDATION_CONDITION_DESCRIPTIONS.get(
